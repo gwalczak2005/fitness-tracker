@@ -229,7 +229,9 @@ fun FitnessTrackerApp() {
                         
                         scope.launch(Dispatchers.IO) { 
                             val id = dao.insertSession(WorkoutSessionEntity(name = newSession.name, date = newSession.date, startTime = newSession.startTime, endTime = newSession.endTime, exercisesJson = Gson().toJson(newSession.exercises), timestamp = newSession.timestamp))
-                            workoutHistory.add(0, newSession.copy(id = id))
+                            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                workoutHistory.add(0, newSession.copy(id = id))
+                            }
                         }
                         sessionStartTimes.remove(workoutName)
                         exercisesPerWorkout[workoutName] = currentEx.map { ex -> ex.copy(sets = ex.sets.map { s -> WorkoutSet("", "", s.currentKg.ifEmpty { s.lastKg }, s.currentReps.ifEmpty { s.lastReps }) }) }
@@ -341,6 +343,11 @@ fun ExerciseCard(ex: Exercise, onChange: (Exercise) -> Unit, onDel: () -> Unit, 
                 }
                 Box { IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, null) }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(text = { Text("Satz hinzufügen") }, onClick = { 
+                            val newSets = ex.sets + WorkoutSet("", "", "", "")
+                            onChange(ex.copy(sets = newSets))
+                            menu = false 
+                        }, leadingIcon = { Icon(Icons.Default.Add, null) })
                         DropdownMenuItem(text = { Text("Beschreibung") }, onClick = { menu = false; showDesc = !showDesc }, leadingIcon = { Icon(Icons.Default.Info, null) })
                         DropdownMenuItem(text = { Text("Beschreibung bearbeiten") }, onClick = { menu = false; dVal = description; descDialog = true }, leadingIcon = { Icon(Icons.Default.Edit, null) })
                         DropdownMenuItem(text = { Text("Umbenennen") }, onClick = { menu = false; rVal = ex.name; ren = true }, leadingIcon = { Icon(Icons.Default.Edit, null) })
@@ -350,7 +357,14 @@ fun ExerciseCard(ex: Exercise, onChange: (Exercise) -> Unit, onDel: () -> Unit, 
             }
             Spacer(Modifier.height(12.dp))
             LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                itemsIndexed(ex.sets) { i, s -> SetCard(i, s) { up -> val ns = ex.sets.toMutableList(); ns[i] = up; if (ns.size < 3 && i == ns.size - 1 && (up.currentKg.isNotEmpty() || up.currentReps.isNotEmpty())) ns.add(WorkoutSet("", "", "", "")); onChange(ex.copy(sets = ns)) } }
+                itemsIndexed(ex.sets) { i, s -> SetCard(i, s) { up -> 
+                    val ns = ex.sets.toMutableList()
+                    ns[i] = up
+                    if (i == ns.size - 1 && (up.currentKg.isNotEmpty() || up.currentReps.isNotEmpty())) {
+                        ns.add(WorkoutSet("", "", "", ""))
+                    }
+                    onChange(ex.copy(sets = ns))
+                } }
             }
         }
     }
