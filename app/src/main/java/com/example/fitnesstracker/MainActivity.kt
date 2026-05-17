@@ -310,9 +310,28 @@ fun TrainingScreen(
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { Text("ÜBUNGEN", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray) }
             itemsIndexed(currentEx) { i, ex ->
-                ExerciseCard(ex, { up -> if (!sessionStartTimes.containsKey(activeName)) sessionStartTimes[activeName] = System.currentTimeMillis(); val nl = currentEx.toMutableList(); nl[i] = up; exercisesPerWorkout[activeName] = nl; onDataChange() },
-                    { val nl = currentEx.toMutableList(); nl.removeAt(i); exercisesPerWorkout[activeName] = nl; onDataChange() },
-                    { n -> val nl = currentEx.toMutableList(); nl[i] = ex.copy(name = n); exercisesPerWorkout[activeName] = nl; onDataChange() })
+                ExerciseCard(
+                    ex = ex, 
+                    onChange = { up -> if (!sessionStartTimes.containsKey(activeName)) sessionStartTimes[activeName] = System.currentTimeMillis(); val nl = currentEx.toMutableList(); nl[i] = up; exercisesPerWorkout[activeName] = nl; onDataChange() },
+                    onDel = { val nl = currentEx.toMutableList(); nl.removeAt(i); exercisesPerWorkout[activeName] = nl; onDataChange() },
+                    onRen = { n -> val nl = currentEx.toMutableList(); nl[i] = ex.copy(name = n); exercisesPerWorkout[activeName] = nl; onDataChange() },
+                    onMoveUp = if (i > 0) { {
+                        val nl = currentEx.toMutableList()
+                        val temp = nl[i]
+                        nl[i] = nl[i - 1]
+                        nl[i - 1] = temp
+                        exercisesPerWorkout[activeName] = nl
+                        onDataChange()
+                    } } else null,
+                    onMoveDown = if (i < currentEx.size - 1) { {
+                        val nl = currentEx.toMutableList()
+                        val temp = nl[i]
+                        nl[i] = nl[i + 1]
+                        nl[i + 1] = temp
+                        exercisesPerWorkout[activeName] = nl
+                        onDataChange()
+                    } } else null
+                )
             }
             item { Button(onClick = { showAddEx = true }, Modifier.fillMaxWidth().height(48.dp), colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent), border = BorderStroke(1.dp, BluePrimary)) { Text("+ Neue Übung", color = BluePrimary) } }
             if (currentEx.isNotEmpty()) {
@@ -323,7 +342,14 @@ fun TrainingScreen(
 }
 
 @Composable
-fun ExerciseCard(ex: Exercise, onChange: (Exercise) -> Unit, onDel: () -> Unit, onRen: (String) -> Unit) {
+fun ExerciseCard(
+    ex: Exercise, 
+    onChange: (Exercise) -> Unit, 
+    onDel: () -> Unit, 
+    onRen: (String) -> Unit,
+    onMoveUp: (() -> Unit)? = null,
+    onMoveDown: (() -> Unit)? = null
+) {
     var menu by remember { mutableStateOf(false) }; var ren by remember { mutableStateOf(false) }; var rVal by remember { mutableStateOf(ex.name) }
     var descDialog by remember { mutableStateOf(false) }; var dVal by remember { mutableStateOf(ex.description ?: "") }
     var showDesc by remember { mutableStateOf(false) }
@@ -348,6 +374,12 @@ fun ExerciseCard(ex: Exercise, onChange: (Exercise) -> Unit, onDel: () -> Unit, 
                             onChange(ex.copy(sets = newSets))
                             menu = false 
                         }, leadingIcon = { Icon(Icons.Default.Add, null) })
+                        if (onMoveUp != null) {
+                            DropdownMenuItem(text = { Text("Nach oben verschieben") }, onClick = { onMoveUp(); menu = false }, leadingIcon = { Icon(Icons.Default.KeyboardArrowUp, null) })
+                        }
+                        if (onMoveDown != null) {
+                            DropdownMenuItem(text = { Text("Nach unten verschieben") }, onClick = { onMoveDown(); menu = false }, leadingIcon = { Icon(Icons.Default.KeyboardArrowDown, null) })
+                        }
                         DropdownMenuItem(text = { Text("Beschreibung") }, onClick = { menu = false; showDesc = !showDesc }, leadingIcon = { Icon(Icons.Default.Info, null) })
                         DropdownMenuItem(text = { Text("Beschreibung bearbeiten") }, onClick = { menu = false; dVal = description; descDialog = true }, leadingIcon = { Icon(Icons.Default.Edit, null) })
                         DropdownMenuItem(text = { Text("Umbenennen") }, onClick = { menu = false; rVal = ex.name; ren = true }, leadingIcon = { Icon(Icons.Default.Edit, null) })
