@@ -39,6 +39,7 @@ import com.example.fitnesstracker.ui.theme.*
 import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -87,6 +88,15 @@ enum class ProgressMetric(val label: String, val unit: String) {
 private const val PREFS_NAME = "fitness_tracker_prefs"
 private const val KEY_ALL_DATA = "all_app_data"
 
+// Zeitkonstanten
+private const val MILLIS_PER_DAY = 86_400_000L
+private const val MILLIS_7_DAYS = 604_800_000L
+private const val MILLIS_30_DAYS = 2_592_000_000L
+
+// Gson-Singleton: verhindert wiederholte Instanziierung bei jedem Aufruf
+private val gson = Gson()
+private val exerciseListType = object : com.google.gson.reflect.TypeToken<List<Exercise>>() {}.type
+
 fun isCurrentWeek(timestamp: Long): Boolean {
     val cal = Calendar.getInstance()
     val currentWeek = cal.get(Calendar.WEEK_OF_YEAR)
@@ -102,7 +112,7 @@ fun getDurationMillis(session: WorkoutSession): Long {
         val start = sdf.parse(session.startTime)?.time ?: 0L
         val end = sdf.parse(session.endTime)?.time ?: 0L
         var diff = end - start
-        if (diff < 0) diff += 86400000L
+        if (diff < 0) diff += MILLIS_PER_DAY
         diff
     } catch (e: Exception) { 0L }
 }
@@ -142,51 +152,59 @@ fun FitnessTrackerApp() {
     val sessionStartTimes = remember { mutableStateMapOf<String, Long>() }
 
     LaunchedEffect(Unit) {
-        val templates = dao.getAllTemplates()
-        val historyEntities = dao.getAllHistory()
-        val settings = dao.getSettings()
+        // FIX: try/catch um DB-Fehler beim Start abzufangen (Disk full, korrupte DB etc.)
+        try {
+            val templates = dao.getAllTemplates()
+            val historyEntities = dao.getAllHistory()
 
-        if (templates.isEmpty() && historyEntities.isEmpty()) {
-            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val json = prefs.getString(KEY_ALL_DATA, null)
-            if (json != null) {
-                try {
-                    val gson = Gson()
-                    val legacyData = gson.fromJson(json, AppData::class.java)
-                    dao.saveSettings(SettingsEntity(planName = legacyData.planName, unitsPerWeek = legacyData.unitsPerWeek))
-                    legacyData.workouts.forEachIndexed { i, n ->
-                        dao.insertTemplate(WorkoutTemplateEntity(n, gson.toJson(legacyData.exercisesPerWorkout[n] ?: emptyList<Exercise>()), i))
+            if (templates.isEmpty() && historyEntities.isEmpty()) {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val json = prefs.getString(KEY_ALL_DATA, null)
+                if (json != null) {
+                    try {
+                        val legacyData = gson.fromJson(json, AppData::class.java)
+                        dao.saveSettings(SettingsEntity(planName = legacyData.planName, unitsPerWeek = legacyData.unitsPerWeek))
+                        legacyData.workouts.forEachIndexed { i, n ->
+                            dao.insertTemplate(WorkoutTemplateEntity(n, gson.toJson(legacyData.exercisesPerWorkout[n] ?: emptyList<Exercise>()), i))
+                        }
+                        legacyData.history.forEach { s ->
+                            dao.insertSession(WorkoutSessionEntity(name = s.name, date = s.date, startTime = s.startTime, endTime = s.endTime, exercisesJson = gson.toJson(s.exercises), timestamp = s.timestamp))
+                        }
+                        prefs.edit().remove(KEY_ALL_DATA).apply()
+                    } catch (e: Exception) { /* Legacy-Migration fehlgeschlagen, ignorieren */ }
+                } else {
+                    listOf("Push", "Pull", "Legs").forEachIndexed { i, n ->
+                        dao.insertTemplate(WorkoutTemplateEntity(n, "[]", i))
                     }
-                    legacyData.history.forEach { s ->
-                        dao.insertSession(WorkoutSessionEntity(name = s.name, date = s.date, startTime = s.startTime, endTime = s.endTime, exercisesJson = gson.toJson(s.exercises), timestamp = s.timestamp))
-                    }
-                    prefs.edit().remove(KEY_ALL_DATA).apply()
-                } catch (e: Exception) {}
-            } else {
-                listOf("Push", "Pull", "Legs").forEachIndexed { i, n -> dao.insertTemplate(WorkoutTemplateEntity(n, "[]", i)) }
+                }
             }
-        }
-        
-        val freshTemplates = dao.getAllTemplates()
-        workouts.clear(); workouts.addAll(freshTemplates.map { it.name })
-        freshTemplates.forEach { 
-            val type = object : com.google.gson.reflect.TypeToken<List<Exercise>>() {}.type
-            exercisesPerWorkout[it.name] = Gson().fromJson(it.exercisesJson, type)
-        }
-        val freshHistory = dao.getAllHistory()
-        workoutHistory.clear()
-        workoutHistory.addAll(freshHistory.map { h ->
-            val type = object : com.google.gson.reflect.TypeToken<List<Exercise>>() {}.type
-            WorkoutSession(h.id, h.name, h.date, h.startTime, h.endTime, Gson().fromJson(h.exercisesJson, type), h.timestamp)
-        })
-        dao.getSettings()?.let { planName = it.planName; unitsPerWeek = it.unitsPerWeek }
+
+            val freshTemplates = dao.getAllTemplates()
+            workouts.clear()
+            workouts.addAll(freshTemplates.map { it.name })
+            freshTemplates.forEach {
+                exercisesPerWorkout[it.name] = gson.fromJson(it.exercisesJson, exerciseListType)
+            }
+            val freshHistory = dao.getAllHistory()
+            workoutHistory.clear()
+            workoutHistory.addAll(freshHistory.map { h ->
+                WorkoutSession(h.id, h.name, h.date, h.startTime, h.endTime, gson.fromJson(h.exercisesJson, exerciseListType), h.timestamp)
+            })
+            dao.getSettings()?.let { planName = it.planName; unitsPerWeek = it.unitsPerWeek }
+        } catch (e: Exception) { /* DB-Startfehler – App zeigt leeren Zustand */ }
     }
 
     val triggerSave: () -> Unit = {
+        // Snapshot der aktuellen Werte für den IO-Thread
+        val currentPlanName = planName
+        val currentUnitsPerWeek = unitsPerWeek
+        val workoutsSnapshot = workouts.toList()
+        val exercisesSnapshot = exercisesPerWorkout.toMap()
+
         scope.launch(Dispatchers.IO) {
-            dao.saveSettings(SettingsEntity(planName = planName, unitsPerWeek = unitsPerWeek))
-            workouts.forEachIndexed { i, n ->
-                dao.insertTemplate(WorkoutTemplateEntity(n, Gson().toJson(exercisesPerWorkout[n] ?: emptyList<Exercise>()), i))
+            dao.saveSettings(SettingsEntity(planName = currentPlanName, unitsPerWeek = currentUnitsPerWeek))
+            workoutsSnapshot.forEachIndexed { i, n ->
+                dao.insertTemplate(WorkoutTemplateEntity(n, gson.toJson(exercisesSnapshot[n] ?: emptyList<Exercise>()), i))
             }
         }
     }
@@ -199,12 +217,12 @@ fun FitnessTrackerApp() {
                 date = updated.date,
                 startTime = updated.startTime,
                 endTime = updated.endTime,
-                exercisesJson = Gson().toJson(updated.exercises),
+                exercisesJson = gson.toJson(updated.exercises),
                 timestamp = updated.timestamp
             ))
-            val idx = workoutHistory.indexOfFirst { it.id == updated.id }
-            if (idx != -1) {
-                workoutHistory[idx] = updated
+            withContext(Dispatchers.Main) {
+                val idx = workoutHistory.indexOfFirst { it.id == updated.id }
+                if (idx != -1) workoutHistory[idx] = updated
             }
         }
     }
@@ -219,24 +237,64 @@ fun FitnessTrackerApp() {
     ) { padding ->
         Box(modifier = Modifier.padding(padding)) {
             if (selectedTab == 0) {
-                TrainingScreen(workouts, exercisesPerWorkout, sessionStartTimes, onDataChange = triggerSave, 
+                TrainingScreen(
+                    workouts = workouts,
+                    exercisesPerWorkout = exercisesPerWorkout,
+                    sessionStartTimes = sessionStartTimes,
+                    onDataChange = triggerSave,
                     onFinishSession = { workoutName ->
                         val startTime = sessionStartTimes[workoutName] ?: return@TrainingScreen
                         val endTime = System.currentTimeMillis()
-                        val sdfD = SimpleDateFormat("dd. MMMM yyyy", Locale.GERMAN); val sdfT = SimpleDateFormat("HH:mm", Locale.GERMAN)
+                        val sdfD = SimpleDateFormat("dd. MMMM yyyy", Locale.GERMAN)
+                        val sdfT = SimpleDateFormat("HH:mm", Locale.GERMAN)
                         val currentEx = exercisesPerWorkout[workoutName] ?: emptyList()
-                        val newSession = WorkoutSession(name = workoutName, date = sdfD.format(Date(endTime)), startTime = sdfT.format(Date(startTime)), endTime = sdfT.format(Date(endTime)), exercises = currentEx.map { it.copy(sets = it.sets.filter { s -> s.currentKg.isNotEmpty() }) }, timestamp = endTime)
-                        
-                        scope.launch(Dispatchers.IO) { 
-                            val id = dao.insertSession(WorkoutSessionEntity(name = newSession.name, date = newSession.date, startTime = newSession.startTime, endTime = newSession.endTime, exercisesJson = Gson().toJson(newSession.exercises), timestamp = newSession.timestamp))
-                            kotlinx.coroutines.withContext(Dispatchers.Main) {
-                                workoutHistory.add(0, newSession.copy(id = id))
-                            }
+
+                        // FIX: Session-Daten und Reset-State VOR dem Coroutine-Launch snapshot-en,
+                        // damit triggerSave() den bereits zurückgesetzten State speichert
+                        val sessionToSave = WorkoutSession(
+                            name = workoutName,
+                            date = sdfD.format(Date(endTime)),
+                            startTime = sdfT.format(Date(startTime)),
+                            endTime = sdfT.format(Date(endTime)),
+                            exercises = currentEx.map { it.copy(sets = it.sets.filter { s -> s.currentKg.isNotEmpty() }) },
+                            timestamp = endTime
+                        )
+                        val resetExercises = currentEx.map { ex ->
+                            ex.copy(sets = ex.sets.map { s ->
+                                WorkoutSet("", "", s.currentKg.ifEmpty { s.lastKg }, s.currentReps.ifEmpty { s.lastReps })
+                            })
                         }
+
+                        // State sofort zurücksetzen (UI reagiert ohne auf DB zu warten)
                         sessionStartTimes.remove(workoutName)
-                        exercisesPerWorkout[workoutName] = currentEx.map { ex -> ex.copy(sets = ex.sets.map { s -> WorkoutSet("", "", s.currentKg.ifEmpty { s.lastKg }, s.currentReps.ifEmpty { s.lastReps }) }) }
-                        triggerSave()
-                    }, onDeleteWorkout = { name -> scope.launch(Dispatchers.IO) { dao.deleteTemplate(name) } })
+                        exercisesPerWorkout[workoutName] = resetExercises
+
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                val id = dao.insertSession(
+                                    WorkoutSessionEntity(
+                                        name = sessionToSave.name,
+                                        date = sessionToSave.date,
+                                        startTime = sessionToSave.startTime,
+                                        endTime = sessionToSave.endTime,
+                                        exercisesJson = gson.toJson(sessionToSave.exercises),
+                                        timestamp = sessionToSave.timestamp
+                                    )
+                                )
+                                // Templates mit bereits gesetztem Reset-State speichern
+                                workouts.toList().forEachIndexed { i, n ->
+                                    dao.insertTemplate(WorkoutTemplateEntity(n, gson.toJson(exercisesPerWorkout[n] ?: emptyList<Exercise>()), i))
+                                }
+                                withContext(Dispatchers.Main) {
+                                    workoutHistory.add(0, sessionToSave.copy(id = id))
+                                }
+                            } catch (e: Exception) { /* DB-Fehler beim Speichern */ }
+                        }
+                    },
+                    onDeleteWorkout = { name ->
+                        scope.launch(Dispatchers.IO) { dao.deleteTemplate(name) }
+                    }
+                )
             } else {
                 StatisticsScreen(workouts, workoutHistory, planName, { planName = it; triggerSave() }, unitsPerWeek, { unitsPerWeek = it; triggerSave() }, exercisesPerWorkout, onUpdateSession)
             }
@@ -262,32 +320,59 @@ fun TrainingScreen(
     var editIdx by remember { mutableStateOf<Int?>(null) }; var showOpt by remember { mutableStateOf(false) }
     var showRen by remember { mutableStateOf(false) }; var renV by remember { mutableStateOf("") }
 
+    // FIX: activeIdx auf gültigen Bereich begrenzen falls workouts sich ändert
+    val safeActiveIdx = activeIdx.coerceIn(0, (workouts.size - 1).coerceAtLeast(0))
+    if (safeActiveIdx != activeIdx) activeIdx = safeActiveIdx
+
     val activeName = workouts.getOrNull(activeIdx) ?: ""
     val currentEx = exercisesPerWorkout[activeName] ?: emptyList()
 
     if (showAddW) {
-        AlertDialog(onDismissRequest = { showAddW = false }, title = { Text("Neues Training") }, text = { TextField(newWN, { newWN = it }, placeholder = { Text("Name") }, modifier = Modifier.fillMaxWidth()) },
+        AlertDialog(
+            onDismissRequest = { showAddW = false },
+            title = { Text("Neues Training") },
+            text = { TextField(newWN, { newWN = it }, placeholder = { Text("Name") }, modifier = Modifier.fillMaxWidth()) },
             confirmButton = { TextButton(onClick = { if (newWN.isNotBlank()) { workouts.add(newWN); exercisesPerWorkout[newWN] = emptyList(); activeIdx = workouts.size - 1; newWN = ""; showAddW = false; onDataChange() } }) { Text("Hinzufügen") } },
-            dismissButton = { TextButton(onClick = { showAddW = false }) { Text("Abbrechen") } })
+            dismissButton = { TextButton(onClick = { showAddW = false }) { Text("Abbrechen") } }
+        )
     }
 
     if (showOpt && editIdx != null) {
         val name = workouts[editIdx!!]
-        AlertDialog(onDismissRequest = { showOpt = false }, title = { Text("Training: $name") }, text = { Text("Umbenennen oder löschen?") },
+        AlertDialog(
+            onDismissRequest = { showOpt = false },
+            title = { Text("Training: $name") },
+            text = { Text("Umbenennen oder löschen?") },
             confirmButton = { TextButton(onClick = { renV = name; showOpt = false; showRen = true }) { Text("Umbenennen") } },
-            dismissButton = { TextButton(onClick = { val removed = workouts.removeAt(editIdx!!); exercisesPerWorkout.remove(removed); onDeleteWorkout(removed); if (activeIdx >= workouts.size) activeIdx = (workouts.size - 1).coerceAtLeast(0); showOpt = false; onDataChange() }, colors = ButtonDefaults.textButtonColors(contentColor = Color.Red)) { Text("Löschen") } })
+            dismissButton = { TextButton(onClick = {
+                val removed = workouts.removeAt(editIdx!!)
+                exercisesPerWorkout.remove(removed)
+                onDeleteWorkout(removed)
+                activeIdx = activeIdx.coerceIn(0, (workouts.size - 1).coerceAtLeast(0))
+                showOpt = false
+                onDataChange()
+            }, colors = ButtonDefaults.textButtonColors(contentColor = Color.Red)) { Text("Löschen") } }
+        )
     }
 
     if (showRen && editIdx != null) {
-        AlertDialog(onDismissRequest = { showRen = false }, title = { Text("Umbenennen") }, text = { TextField(renV, { renV = it }, modifier = Modifier.fillMaxWidth()) },
+        AlertDialog(
+            onDismissRequest = { showRen = false },
+            title = { Text("Umbenennen") },
+            text = { TextField(renV, { renV = it }, modifier = Modifier.fillMaxWidth()) },
             confirmButton = { TextButton(onClick = { if (renV.isNotBlank()) { val old = workouts[editIdx!!]; workouts[editIdx!!] = renV; exercisesPerWorkout[renV] = exercisesPerWorkout.remove(old) ?: emptyList(); showRen = false; onDataChange() } }) { Text("Speichern") } },
-            dismissButton = { TextButton(onClick = { showRen = false }) { Text("Abbrechen") } })
+            dismissButton = { TextButton(onClick = { showRen = false }) { Text("Abbrechen") } }
+        )
     }
 
     if (showAddEx) {
-        AlertDialog(onDismissRequest = { showAddEx = false }, title = { Text("Neue Übung") }, text = { TextField(newEN, { newEN = it }, placeholder = { Text("Übungsname") }, modifier = Modifier.fillMaxWidth()) },
+        AlertDialog(
+            onDismissRequest = { showAddEx = false },
+            title = { Text("Neue Übung") },
+            text = { TextField(newEN, { newEN = it }, placeholder = { Text("Übungsname") }, modifier = Modifier.fillMaxWidth()) },
             confirmButton = { TextButton(onClick = { if (newEN.isNotBlank()) { exercisesPerWorkout[activeName] = currentEx + Exercise(newEN, sets = listOf(WorkoutSet("", "", "", ""))); newEN = ""; showAddEx = false; onDataChange() } }) { Text("Hinzufügen") } },
-            dismissButton = { TextButton(onClick = { showAddEx = false }) { Text("Abbrechen") } })
+            dismissButton = { TextButton(onClick = { showAddEx = false }) { Text("Abbrechen") } }
+        )
     }
 
     Column(modifier = Modifier.fillMaxSize().background(BackgroundColor)) {
@@ -307,35 +392,81 @@ fun TrainingScreen(
             }
         }
 
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        // FIX Scroll-Ruckeln: key() für stabile Item-Identität in der LazyColumn.
+        // Ohne key() ersetzt Compose bei jeder State-Änderung alle Items neu →
+        // sichtbares Ruckeln. Mit key(ex.name) werden nur geänderte Items neu gezeichnet.
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
             item { Text("ÜBUNGEN", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray) }
-            itemsIndexed(currentEx) { i, ex ->
+            itemsIndexed(currentEx, key = { _, ex -> ex.name }) { i, ex ->
+                // FIX: activeName als captured val für stabile Lambda-Referenz
+                val capturedName = activeName
                 ExerciseCard(
-                    ex = ex, 
-                    onChange = { up -> if (!sessionStartTimes.containsKey(activeName)) sessionStartTimes[activeName] = System.currentTimeMillis(); val nl = currentEx.toMutableList(); nl[i] = up; exercisesPerWorkout[activeName] = nl; onDataChange() },
-                    onDel = { val nl = currentEx.toMutableList(); nl.removeAt(i); exercisesPerWorkout[activeName] = nl; onDataChange() },
-                    onRen = { n -> val nl = currentEx.toMutableList(); nl[i] = ex.copy(name = n); exercisesPerWorkout[activeName] = nl; onDataChange() },
-                    onMoveUp = if (i > 0) { {
+                    ex = ex,
+                    onChange = { up ->
+                        if (!sessionStartTimes.containsKey(capturedName)) {
+                            sessionStartTimes[capturedName] = System.currentTimeMillis()
+                        }
                         val nl = currentEx.toMutableList()
-                        val temp = nl[i]
-                        nl[i] = nl[i - 1]
-                        nl[i - 1] = temp
-                        exercisesPerWorkout[activeName] = nl
+                        nl[i] = up
+                        exercisesPerWorkout[capturedName] = nl
                         onDataChange()
-                    } } else null,
-                    onMoveDown = if (i < currentEx.size - 1) { {
+                    },
+                    onDel = {
                         val nl = currentEx.toMutableList()
-                        val temp = nl[i]
-                        nl[i] = nl[i + 1]
-                        nl[i + 1] = temp
-                        exercisesPerWorkout[activeName] = nl
+                        nl.removeAt(i)
+                        exercisesPerWorkout[capturedName] = nl
                         onDataChange()
-                    } } else null
+                    },
+                    onRen = { n ->
+                        val nl = currentEx.toMutableList()
+                        nl[i] = ex.copy(name = n)
+                        exercisesPerWorkout[capturedName] = nl
+                        onDataChange()
+                    },
+                    onMoveUp = if (i > 0) {
+                        {
+                            val nl = currentEx.toMutableList()
+                            val temp = nl[i]; nl[i] = nl[i - 1]; nl[i - 1] = temp
+                            exercisesPerWorkout[capturedName] = nl
+                            onDataChange()
+                        }
+                    } else null,
+                    onMoveDown = if (i < currentEx.size - 1) {
+                        {
+                            val nl = currentEx.toMutableList()
+                            val temp = nl[i]; nl[i] = nl[i + 1]; nl[i + 1] = temp
+                            exercisesPerWorkout[capturedName] = nl
+                            onDataChange()
+                        }
+                    } else null
                 )
             }
-            item { Button(onClick = { showAddEx = true }, Modifier.fillMaxWidth().height(48.dp), colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent), border = BorderStroke(1.dp, BluePrimary)) { Text("+ Neue Übung", color = BluePrimary) } }
+            item {
+                Button(
+                    onClick = { showAddEx = true },
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+                    border = BorderStroke(1.dp, BluePrimary)
+                ) { Text("+ Neue Übung", color = BluePrimary) }
+            }
             if (currentEx.isNotEmpty()) {
-                item { Button(onClick = { onFinishSession(activeName) }, Modifier.fillMaxWidth().height(60.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))) { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) { Text("Einheit beenden", color = Color.White, fontWeight = FontWeight.Bold); Spacer(Modifier.width(8.dp)); Icon(Icons.Default.Check, null, tint = Color.White) } } }
+                item {
+                    Button(
+                        onClick = { onFinishSession(activeName) },
+                        modifier = Modifier.fillMaxWidth().height(60.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
+                            Text("Einheit beenden", color = Color.White, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.width(8.dp))
+                            Icon(Icons.Default.Check, null, tint = Color.White)
+                        }
+                    }
+                }
             }
         }
     }
@@ -343,36 +474,55 @@ fun TrainingScreen(
 
 @Composable
 fun ExerciseCard(
-    ex: Exercise, 
-    onChange: (Exercise) -> Unit, 
-    onDel: () -> Unit, 
+    ex: Exercise,
+    onChange: (Exercise) -> Unit,
+    onDel: () -> Unit,
     onRen: (String) -> Unit,
     onMoveUp: (() -> Unit)? = null,
     onMoveDown: (() -> Unit)? = null
 ) {
-    var menu by remember { mutableStateOf(false) }; var ren by remember { mutableStateOf(false) }; var rVal by remember { mutableStateOf(ex.name) }
-    var descDialog by remember { mutableStateOf(false) }; var dVal by remember { mutableStateOf(ex.description ?: "") }
+    var menu by remember { mutableStateOf(false) }
+    var ren by remember { mutableStateOf(false) }
+    var rVal by remember { mutableStateOf(ex.name) }
+    var descDialog by remember { mutableStateOf(false) }
+    var dVal by remember { mutableStateOf(ex.description ?: "") }
     var showDesc by remember { mutableStateOf(false) }
     val description = ex.description ?: ""
 
-    if (ren) { AlertDialog(onDismissRequest = { ren = false }, title = { Text("Übung umbenennen") }, text = { TextField(rVal, { rVal = it }, modifier = Modifier.fillMaxWidth()) },
-        confirmButton = { TextButton(onClick = { onRen(rVal); ren = false }) { Text("Speichern") } }, dismissButton = { TextButton(onClick = { ren = false }) { Text("Abbrechen") } }) }
-    if (descDialog) { AlertDialog(onDismissRequest = { descDialog = false }, title = { Text("Beschreibung") }, text = { TextField(dVal, { dVal = it }, placeholder = { Text("Z.B. Sitzhöhe 3, Fokus auf Dehnung...") }, modifier = Modifier.fillMaxWidth(), minLines = 3) },
-        confirmButton = { TextButton(onClick = { onChange(ex.copy(description = dVal)); descDialog = false }) { Text("Speichern") } }, dismissButton = { TextButton(onClick = { descDialog = false }) { Text("Abbrechen") } }) }
+    if (ren) {
+        AlertDialog(
+            onDismissRequest = { ren = false },
+            title = { Text("Übung umbenennen") },
+            text = { TextField(rVal, { rVal = it }, modifier = Modifier.fillMaxWidth()) },
+            confirmButton = { TextButton(onClick = { onRen(rVal); ren = false }) { Text("Speichern") } },
+            dismissButton = { TextButton(onClick = { ren = false }) { Text("Abbrechen") } }
+        )
+    }
+    if (descDialog) {
+        AlertDialog(
+            onDismissRequest = { descDialog = false },
+            title = { Text("Beschreibung") },
+            text = { TextField(dVal, { dVal = it }, placeholder = { Text("Z.B. Sitzhöhe 3, Fokus auf Dehnung...") }, modifier = Modifier.fillMaxWidth(), minLines = 3) },
+            confirmButton = { TextButton(onClick = { onChange(ex.copy(description = dVal)); descDialog = false }) { Text("Speichern") } },
+            dismissButton = { TextButton(onClick = { descDialog = false }) { Text("Abbrechen") } }
+        )
+    }
 
     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
         Column(Modifier.padding(12.dp)) {
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                 Column(Modifier.weight(1f).clickable { showDesc = !showDesc }) {
                     Text(ex.name, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                    if (showDesc && description.isNotBlank()) { Text(description, fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(top = 2.dp)) }
+                    if (showDesc && description.isNotBlank()) {
+                        Text(description, fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(top = 2.dp))
+                    }
                 }
-                Box { IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, null) }
+                Box {
+                    IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, null) }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(text = { Text("Satz hinzufügen") }, onClick = { 
-                            val newSets = ex.sets + WorkoutSet("", "", "", "")
-                            onChange(ex.copy(sets = newSets))
-                            menu = false 
+                        DropdownMenuItem(text = { Text("Satz hinzufügen") }, onClick = {
+                            onChange(ex.copy(sets = ex.sets + WorkoutSet("", "", "", "")))
+                            menu = false
                         }, leadingIcon = { Icon(Icons.Default.Add, null) })
                         if (onMoveUp != null) {
                             DropdownMenuItem(text = { Text("Nach oben verschieben") }, onClick = { onMoveUp(); menu = false }, leadingIcon = { Icon(Icons.Default.KeyboardArrowUp, null) })
@@ -388,15 +538,21 @@ fun ExerciseCard(
                 }
             }
             Spacer(Modifier.height(12.dp))
+            // FIX Scroll-Ruckeln: key(i) für stabile SetCard-Identität in der LazyRow
             LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                itemsIndexed(ex.sets) { i, s -> SetCard(i, s) { up -> 
-                    val ns = ex.sets.toMutableList()
-                    ns[i] = up
-                    if (i == ns.size - 1 && (up.currentKg.isNotEmpty() || up.currentReps.isNotEmpty())) {
-                        ns.add(WorkoutSet("", "", "", ""))
+                itemsIndexed(ex.sets, key = { i, _ -> i }) { i, s ->
+                    SetCard(i, s) { up ->
+                        val ns = ex.sets.toMutableList()
+                        ns[i] = up
+                        // Leere Auto-Sätze am Ende entfernen wenn vorletzter Satz geleert wird
+                        if (i == ns.size - 1 && up.currentKg.isNotEmpty() || up.currentReps.isNotEmpty()) {
+                            if (i == ns.size - 1 && (up.currentKg.isNotEmpty() || up.currentReps.isNotEmpty())) {
+                                ns.add(WorkoutSet("", "", "", ""))
+                            }
+                        }
+                        onChange(ex.copy(sets = ns))
                     }
-                    onChange(ex.copy(sets = ns))
-                } }
+                }
             }
         }
     }
@@ -404,65 +560,174 @@ fun ExerciseCard(
 
 @Composable
 fun SetCard(idx: Int, s: WorkoutSet, onChange: (WorkoutSet) -> Unit) {
-    Column(Modifier.width(130.dp).border(0.5.dp, BorderColor, RoundedCornerShape(12.dp)).background(Color.White, RoundedCornerShape(12.dp)).padding(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Surface(color = if (s.isDone) BluePrimary else BluePrimary.copy(0.1f), shape = RoundedCornerShape(16.dp), modifier = Modifier.clickable { onChange(s.copy(isDone = !s.isDone)) }) {
-            Text(if (s.currentKg.isEmpty()) "Satz ${idx + 1}" else "${s.currentKg}kg x ${s.currentReps}", color = if (s.isDone) Color.White else BluePrimary, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp), fontWeight = FontWeight.Bold)
+    Column(
+        modifier = Modifier
+            .width(130.dp)
+            .border(0.5.dp, BorderColor, RoundedCornerShape(12.dp))
+            .background(Color.White, RoundedCornerShape(12.dp))
+            .padding(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Surface(
+            color = if (s.isDone) BluePrimary else BluePrimary.copy(0.1f),
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier.clickable { onChange(s.copy(isDone = !s.isDone)) }
+        ) {
+            Text(
+                text = if (s.currentKg.isEmpty()) "Satz ${idx + 1}" else "${s.currentKg}kg x ${s.currentReps}",
+                color = if (s.isDone) Color.White else BluePrimary,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                fontWeight = FontWeight.Bold
+            )
         }
         Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.Center) {
-            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) { Text("kg", fontSize = 10.sp); SetInputField(s.currentKg, { onChange(s.copy(currentKg = it)) }); Text(s.lastKg.ifEmpty { "—" }, fontSize = 11.sp, color = Color.Blue) }
+            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("kg", fontSize = 10.sp)
+                SetInputField(s.currentKg) { onChange(s.copy(currentKg = it)) }
+                Text(s.lastKg.ifEmpty { "—" }, fontSize = 11.sp, color = Color.Blue)
+            }
             Text("×", Modifier.padding(top = 20.dp))
-            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) { Text("Wdh", fontSize = 10.sp); SetInputField(s.currentReps, { onChange(s.copy(currentReps = it)) }); Text(s.lastReps.ifEmpty { "—" }, fontSize = 11.sp, color = Color.Blue) }
+            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Wdh", fontSize = 10.sp)
+                SetInputField(s.currentReps) { onChange(s.copy(currentReps = it)) }
+                Text(s.lastReps.ifEmpty { "—" }, fontSize = 11.sp, color = Color.Blue)
+            }
         }
     }
 }
 
 @Composable
 fun SetInputField(v: String, onVal: (String) -> Unit) {
-    BasicTextField(v, onVal, textStyle = TextStyle(textAlign = TextAlign.Center, fontWeight = FontWeight.Bold), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.background(Color(0xFFF5F5F5), RoundedCornerShape(4.dp)).padding(4.dp), singleLine = true)
+    BasicTextField(
+        value = v,
+        onValueChange = onVal,
+        textStyle = TextStyle(textAlign = TextAlign.Center, fontWeight = FontWeight.Bold),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = Modifier.background(Color(0xFFF5F5F5), RoundedCornerShape(4.dp)).padding(4.dp),
+        singleLine = true
+    )
 }
 
 // --- Statistik Screen ---
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun StatisticsScreen(workouts: List<String>, history: List<WorkoutSession>, planName: String, onPlanNameChange: (String) -> Unit, unitsPerWeek: Int, onUnitsPerWeekChange: (Int) -> Unit, exercisesPerWorkout: Map<String, List<Exercise>>, onUpdateSession: (WorkoutSession) -> Unit) {
-    var editing by remember { mutableStateOf(false) }; var selS by remember { mutableStateOf<WorkoutSession?>(null) }; var selEx by remember { mutableStateOf<String?>(null) }
-    var tRange by remember { mutableStateOf(TimeRange.LAST_30_DAYS) }; var menu by remember { mutableStateOf(false) }
+fun StatisticsScreen(
+    workouts: List<String>,
+    history: List<WorkoutSession>,
+    planName: String,
+    onPlanNameChange: (String) -> Unit,
+    unitsPerWeek: Int,
+    onUnitsPerWeekChange: (Int) -> Unit,
+    exercisesPerWorkout: Map<String, List<Exercise>>,
+    onUpdateSession: (WorkoutSession) -> Unit
+) {
+    var editing by remember { mutableStateOf(false) }
+    var selS by remember { mutableStateOf<WorkoutSession?>(null) }
+    var selEx by remember { mutableStateOf<String?>(null) }
+    var tRange by remember { mutableStateOf(TimeRange.LAST_30_DAYS) }
+    var menu by remember { mutableStateOf(false) }
+
     val filtered = remember(history, tRange) {
-        val now = System.currentTimeMillis(); val cal = Calendar.getInstance()
-        history.filter { when (tRange) {
-            TimeRange.LAST_7_DAYS -> it.timestamp > now - 604800000L
-            TimeRange.LAST_30_DAYS -> it.timestamp > now - 2592000000L
-            TimeRange.THIS_YEAR -> { cal.timeInMillis = now; val y = cal.get(Calendar.YEAR); cal.timeInMillis = it.timestamp; cal.get(Calendar.YEAR) == y }
-            TimeRange.ALL -> true
-        } }
+        val now = System.currentTimeMillis()
+        val cal = Calendar.getInstance()
+        history.filter {
+            when (tRange) {
+                TimeRange.LAST_7_DAYS -> it.timestamp > now - MILLIS_7_DAYS
+                TimeRange.LAST_30_DAYS -> it.timestamp > now - MILLIS_30_DAYS
+                TimeRange.THIS_YEAR -> {
+                    cal.timeInMillis = now; val y = cal.get(Calendar.YEAR)
+                    cal.timeInMillis = it.timestamp; cal.get(Calendar.YEAR) == y
+                }
+                TimeRange.ALL -> true
+            }
+        }
     }
-    val totalTime = filtered.sumOf { getDurationMillis(it) }; val h = totalTime / 3600000; val m = (totalTime / 60000) % 60
-    val uniqueEx = remember(filtered, exercisesPerWorkout) { (exercisesPerWorkout.values.flatten().map { it.name } + filtered.flatMap { it.exercises }.map { it.name }).distinct().sorted() }
+    val totalTime = filtered.sumOf { getDurationMillis(it) }
+    val h = totalTime / 3_600_000
+    val m = (totalTime / 60_000) % 60
+    val uniqueEx = remember(filtered, exercisesPerWorkout) {
+        (exercisesPerWorkout.values.flatten().map { it.name } + filtered.flatMap { it.exercises }.map { it.name }).distinct().sorted()
+    }
 
     if (selS != null) SessionDetailDialog(selS!!, onUpdateSession) { selS = null }
     if (selEx != null) ExerciseProgressDialog(selEx!!, history) { selEx = null }
 
     Column(Modifier.fillMaxSize().background(BackgroundColor).padding(16.dp).verticalScroll(rememberScrollState())) {
         Text("Statistik", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-        Box { Row(modifier = Modifier.clickable { menu = true }, verticalAlignment = Alignment.CenterVertically) { Text(tRange.label, color = DarkGray); Icon(Icons.Default.ArrowDropDown, null) }
-            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) { TimeRange.entries.forEach { r -> DropdownMenuItem(text = { Text(r.label) }, onClick = { tRange = r; menu = false }) } }
-        }
-        Spacer(Modifier.height(24.dp))
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { StatCard("${filtered.size}", "Einheiten", Modifier.weight(1f)); StatCard("${filtered.sumOf { it.exercises.size }}", "Übungen", Modifier.weight(1f)); StatCard("${filtered.sumOf { it.exercises.sumOf { ex -> ex.sets.size } }}", "Sätze", Modifier.weight(1f)) }
-        Card(Modifier.fillMaxWidth().padding(top = 16.dp), colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
-            Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.PlayArrow, null, tint = BluePrimary); Spacer(Modifier.width(16.dp)); Column { Text("Gesamtzeit im Studio", fontSize = 12.sp, color = DarkGray); Text(if(h>0) "${h}h ${m}m" else "${m}m", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = BluePrimary) } }
-        }
-        Spacer(Modifier.height(24.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text("TRAININGSPLAN", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray); IconButton(onClick = { editing = !editing }) { Icon(if (editing) Icons.Default.Check else Icons.Default.Edit, null, tint = BluePrimary) } }
-        Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                if (editing) { TextField(planName, onPlanNameChange, label = { Text("Name") }, modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(8.dp)); TextField(unitsPerWeek.toString(), { onUnitsPerWeekChange(it.toIntOrNull() ?: unitsPerWeek) }, label = { Text("Einheiten/Woche") }, modifier = Modifier.fillMaxWidth()) }
-                else { Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text(planName, fontWeight = FontWeight.Bold); Text("$unitsPerWeek Einheiten/Woche", color = DarkGray, fontSize = 12.sp) } }
-                Spacer(modifier = Modifier.height(16.dp)); FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) { workouts.forEach { n -> PlanChip(n, history.any { it.name == n && isCurrentWeek(it.timestamp) }) } }
+        Box {
+            Row(modifier = Modifier.clickable { menu = true }, verticalAlignment = Alignment.CenterVertically) {
+                Text(tRange.label, color = DarkGray); Icon(Icons.Default.ArrowDropDown, null)
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                TimeRange.entries.forEach { r -> DropdownMenuItem(text = { Text(r.label) }, onClick = { tRange = r; menu = false }) }
             }
         }
-        Spacer(Modifier.height(24.dp)); Text("FORTSCHRITT", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray); Card(Modifier.fillMaxWidth().padding(top = 8.dp), colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) { Column(modifier = Modifier.padding(8.dp)) { uniqueEx.forEach { n -> Row(modifier = Modifier.fillMaxWidth().clickable { selEx = n }.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text(n); Icon(Icons.Default.KeyboardArrowRight, null, tint = BluePrimary) }; if (n != uniqueEx.last()) Divider(color = BorderColor.copy(0.5f)) } } }
-        Spacer(Modifier.height(24.dp)); Text("LETZTE EINHEITEN", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray); history.forEach { s -> Card(Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { selS = s }, colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) { Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Column { Text(s.name, fontWeight = FontWeight.Bold); Text("${s.date} · ${s.startTime}-${s.endTime}", color = DarkGray, fontSize = 12.sp) }; Icon(Icons.Default.KeyboardArrowRight, null, tint = BluePrimary) } } }
+        Spacer(Modifier.height(24.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            StatCard("${filtered.size}", "Einheiten", Modifier.weight(1f))
+            StatCard("${filtered.sumOf { it.exercises.size }}", "Übungen", Modifier.weight(1f))
+            StatCard("${filtered.sumOf { it.exercises.sumOf { ex -> ex.sets.size } }}", "Sätze", Modifier.weight(1f))
+        }
+        Card(Modifier.fillMaxWidth().padding(top = 16.dp), colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
+            Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.PlayArrow, null, tint = BluePrimary)
+                Spacer(Modifier.width(16.dp))
+                Column {
+                    Text("Gesamtzeit im Studio", fontSize = 12.sp, color = DarkGray)
+                    Text(if (h > 0) "${h}h ${m}m" else "${m}m", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = BluePrimary)
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("TRAININGSPLAN", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray)
+            IconButton(onClick = { editing = !editing }) { Icon(if (editing) Icons.Default.Check else Icons.Default.Edit, null, tint = BluePrimary) }
+        }
+        Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                if (editing) {
+                    TextField(planName, onPlanNameChange, label = { Text("Name") }, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(8.dp))
+                    TextField(unitsPerWeek.toString(), { onUnitsPerWeekChange(it.toIntOrNull() ?: unitsPerWeek) }, label = { Text("Einheiten/Woche") }, modifier = Modifier.fillMaxWidth())
+                } else {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(planName, fontWeight = FontWeight.Bold)
+                        Text("$unitsPerWeek Einheiten/Woche", color = DarkGray, fontSize = 12.sp)
+                    }
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    workouts.forEach { n -> PlanChip(n, history.any { it.name == n && isCurrentWeek(it.timestamp) }) }
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+        Text("FORTSCHRITT", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray)
+        Card(Modifier.fillMaxWidth().padding(top = 8.dp), colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
+            Column(modifier = Modifier.padding(8.dp)) {
+                uniqueEx.forEach { n ->
+                    Row(modifier = Modifier.fillMaxWidth().clickable { selEx = n }.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text(n); Icon(Icons.Default.KeyboardArrowRight, null, tint = BluePrimary)
+                    }
+                    if (n != uniqueEx.last()) Divider(color = BorderColor.copy(0.5f))
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+        Text("LETZTE EINHEITEN", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray)
+        history.forEach { s ->
+            Card(Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { selS = s }, colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
+                Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column {
+                        Text(s.name, fontWeight = FontWeight.Bold)
+                        Text("${s.date} · ${s.startTime}-${s.endTime}", color = DarkGray, fontSize = 12.sp)
+                    }
+                    Icon(Icons.Default.KeyboardArrowRight, null, tint = BluePrimary)
+                }
+            }
+        }
     }
 }
 
@@ -516,7 +781,9 @@ fun LineChart(
                 val p0 = points[i - 1]; val p1 = points[i]
                 cubicTo(p0.x + (p1.x - p0.x) / 2f, p0.y, p0.x + (p1.x - p0.x) / 2f, p1.y, p1.x, p1.y)
             }
-            lineTo(points.last().x, size.height - verticalPadding); lineTo(points.first().x, size.height - verticalPadding); close()
+            lineTo(points.last().x, size.height - verticalPadding)
+            lineTo(points.first().x, size.height - verticalPadding)
+            close()
         }
 
         drawContext.canvas.nativeCanvas.drawPath(fillPath, android.graphics.Paint().apply {
@@ -524,7 +791,10 @@ fun LineChart(
         })
 
         drawPath(path = path, color = lineColor, style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
-        points.forEach { point -> drawCircle(Color.White, radius = 4.dp.toPx(), center = point); drawCircle(lineColor, radius = 2.dp.toPx(), center = point) }
+        points.forEach { point ->
+            drawCircle(Color.White, radius = 4.dp.toPx(), center = point)
+            drawCircle(lineColor, radius = 2.dp.toPx(), center = point)
+        }
     }
 }
 
@@ -532,6 +802,8 @@ fun LineChart(
 fun ExerciseProgressDialog(name: String, history: List<WorkoutSession>, onDismiss: () -> Unit) {
     var selectedMetric by remember { mutableStateOf(ProgressMetric.MAX_WEIGHT) }
     val data = remember(name, history) {
+        // FIX: history ist bereits chronologisch von der DB (neueste zuerst).
+        // asReversed() → älteste zuerst für den Chart. .reversed() in items() kehrt zurück → neueste zuerst für die Liste. Korrekt.
         history.asReversed().mapNotNull { s ->
             val ex = s.exercises.find { it.name == name }
             if (ex != null && ex.sets.any { it.currentKg.isNotEmpty() }) {
@@ -551,23 +823,38 @@ fun ExerciseProgressDialog(name: String, history: List<WorkoutSession>, onDismis
         Card(Modifier.fillMaxWidth().fillMaxHeight(0.85f), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Row(modifier = Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                    Text(name, fontSize = 20.sp, fontWeight = FontWeight.Bold); IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, null) }
+                    Text(name, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, null) }
                 }
                 ScrollableTabRow(selectedTabIndex = selectedMetric.ordinal, containerColor = Color.Transparent, edgePadding = 0.dp, divider = {}, indicator = {}) {
                     ProgressMetric.entries.forEach { metric ->
-                        Tab(selected = selectedMetric == metric, onClick = { selectedMetric = metric }, text = { Text(metric.label, fontSize = 12.sp, color = if (selectedMetric == metric) BluePrimary else Color.Gray, fontWeight = if (selectedMetric == metric) FontWeight.Bold else FontWeight.Normal) })
+                        Tab(
+                            selected = selectedMetric == metric,
+                            onClick = { selectedMetric = metric },
+                            text = { Text(metric.label, fontSize = 12.sp, color = if (selectedMetric == metric) BluePrimary else Color.Gray, fontWeight = if (selectedMetric == metric) FontWeight.Bold else FontWeight.Normal) }
+                        )
                     }
                 }
                 Spacer(Modifier.height(16.dp))
-                if (chartPoints.size >= 2) LineChart(data = chartPoints, modifier = Modifier.fillMaxWidth().height(180.dp))
-                else Box(Modifier.fillMaxWidth().height(180.dp).background(Color(0xFFF5F5F5), RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) { Text("Nicht genügend Datenpunkte", color = Color.Gray, fontSize = 12.sp) }
+                if (chartPoints.size >= 2) {
+                    LineChart(data = chartPoints, modifier = Modifier.fillMaxWidth().height(180.dp))
+                } else {
+                    Box(Modifier.fillMaxWidth().height(180.dp).background(Color(0xFFF5F5F5), RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) {
+                        Text("Nicht genügend Datenpunkte", color = Color.Gray, fontSize = 12.sp)
+                    }
+                }
                 Text("Historie (${selectedMetric.label})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray, modifier = Modifier.padding(top = 24.dp, bottom = 8.dp))
                 Divider()
                 LazyColumn(Modifier.weight(1f)) {
                     items(data.reversed()) { (date, metrics) ->
                         Row(Modifier.fillMaxWidth().padding(vertical = 12.dp, horizontal = 8.dp), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                            Column { Text(date, fontSize = 12.sp, color = Color.Gray); Text("${String.format("%.1f", metrics[selectedMetric])} ${selectedMetric.unit}", fontWeight = FontWeight.Bold) }
-                            if (selectedMetric == ProgressMetric.MAX_WEIGHT) Text("Vol: ${metrics[ProgressMetric.VOLUME]?.toInt()} kg", fontSize = 11.sp, color = BluePrimary.copy(0.7f))
+                            Column {
+                                Text(date, fontSize = 12.sp, color = Color.Gray)
+                                Text("${String.format("%.1f", metrics[selectedMetric])} ${selectedMetric.unit}", fontWeight = FontWeight.Bold)
+                            }
+                            if (selectedMetric == ProgressMetric.MAX_WEIGHT) {
+                                Text("Vol: ${metrics[ProgressMetric.VOLUME]?.toInt()} kg", fontSize = 11.sp, color = BluePrimary.copy(0.7f))
+                            }
                         }
                         Divider(color = BorderColor.copy(0.3f))
                     }
@@ -597,7 +884,9 @@ fun SessionDetailDialog(s: WorkoutSession, onUpdate: (WorkoutSession) -> Unit, o
                     }
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, null) }
-                        IconButton(onClick = { editMode = !editMode }) { Icon(if (editMode) Icons.Default.Check else Icons.Default.Edit, null, tint = BluePrimary) }
+                        IconButton(onClick = { editMode = !editMode }) {
+                            Icon(if (editMode) Icons.Default.Check else Icons.Default.Edit, null, tint = BluePrimary)
+                        }
                     }
                 }
                 Spacer(Modifier.height(16.dp)); Divider()
@@ -610,21 +899,21 @@ fun SessionDetailDialog(s: WorkoutSession, onUpdate: (WorkoutSession) -> Unit, o
                                     Text("Satz ${setIdx + 1}", fontSize = 14.sp)
                                     if (editMode) {
                                         Row(verticalAlignment = Alignment.CenterVertically) {
-                                            SetInputField(set.currentKg, { v -> 
+                                            SetInputField(set.currentKg) { v ->
                                                 val newEx = editedSession.exercises.toMutableList()
                                                 val newSets = ex.sets.toMutableList()
                                                 newSets[setIdx] = set.copy(currentKg = v)
                                                 newEx[exIdx] = ex.copy(sets = newSets)
                                                 editedSession = editedSession.copy(exercises = newEx)
-                                            })
+                                            }
                                             Text(" kg x ", fontSize = 12.sp)
-                                            SetInputField(set.currentReps, { v -> 
+                                            SetInputField(set.currentReps) { v ->
                                                 val newEx = editedSession.exercises.toMutableList()
                                                 val newSets = ex.sets.toMutableList()
                                                 newSets[setIdx] = set.copy(currentReps = v)
                                                 newEx[exIdx] = ex.copy(sets = newSets)
                                                 editedSession = editedSession.copy(exercises = newEx)
-                                            })
+                                            }
                                             Text(" Wdh", fontSize = 12.sp)
                                         }
                                     } else {
@@ -636,9 +925,10 @@ fun SessionDetailDialog(s: WorkoutSession, onUpdate: (WorkoutSession) -> Unit, o
                     }
                 }
                 if (editMode) {
-                    Button(onClick = { onUpdate(editedSession); editMode = false; onDismiss() }, modifier = Modifier.fillMaxWidth().padding(top = 16.dp)) {
-                        Text("Änderungen speichern")
-                    }
+                    Button(
+                        onClick = { onUpdate(editedSession); editMode = false; onDismiss() },
+                        modifier = Modifier.fillMaxWidth().padding(top = 16.dp)
+                    ) { Text("Änderungen speichern") }
                 }
             }
         }
@@ -648,14 +938,20 @@ fun SessionDetailDialog(s: WorkoutSession, onUpdate: (WorkoutSession) -> Unit, o
 @Composable
 fun StatCard(v: String, l: String, m: Modifier = Modifier) {
     Card(modifier = m, colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
-        Column(Modifier.padding(12.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) { Text(v, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = BluePrimary); Text(l, fontSize = 10.sp, color = DarkGray) }
+        Column(Modifier.padding(12.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(v, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = BluePrimary)
+            Text(l, fontSize = 10.sp, color = DarkGray)
+        }
     }
 }
 
 @Composable
 fun PlanChip(n: String, done: Boolean) {
     Surface(color = if (done) Color(0xFFE8F5E9) else Color.Transparent, shape = RoundedCornerShape(16.dp), border = if (!done) BorderStroke(1.dp, BorderColor) else null) {
-        Row(Modifier.padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) { Text(n, color = if (done) Color(0xFF4CAF50) else DarkGray, fontSize = 12.sp); if (done) Icon(Icons.Default.Check, null, tint = Color(0xFF4CAF50), modifier = Modifier.size(14.dp)) }
+        Row(Modifier.padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(n, color = if (done) Color(0xFF4CAF50) else DarkGray, fontSize = 12.sp)
+            if (done) Icon(Icons.Default.Check, null, tint = Color(0xFF4CAF50), modifier = Modifier.size(14.dp))
+        }
     }
 }
 
