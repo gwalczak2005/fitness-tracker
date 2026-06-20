@@ -7,7 +7,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.LazyItemScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,6 +38,8 @@ import com.example.fitnesstracker.data.*
 import com.example.fitnesstracker.ui.theme.*
 import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -83,35 +85,36 @@ enum class ProgressMetric(val label: String, val unit: String) {
     ONE_RM("Est. 1RM", "kg")
 }
 
-// --- Hilfsfunktionen ---
+// --- Konstanten & Singletons ---
 
-private const val PREFS_NAME = "fitness_tracker_prefs"
-private const val KEY_ALL_DATA = "all_app_data"
+private const val PREFS_NAME      = "fitness_tracker_prefs"
+private const val KEY_ALL_DATA    = "all_app_data"
+private const val MILLIS_PER_DAY  = 86_400_000L
+private const val MILLIS_7_DAYS   = 604_800_000L
+private const val MILLIS_30_DAYS  = 2_592_000_000L
+private const val SAVE_DEBOUNCE_MS = 500L
 
-// Zeitkonstanten
-private const val MILLIS_PER_DAY = 86_400_000L
-private const val MILLIS_7_DAYS = 604_800_000L
-private const val MILLIS_30_DAYS = 2_592_000_000L
-
-// Gson-Singleton: verhindert wiederholte Instanziierung bei jedem Aufruf
-private val gson = Gson()
+private val gson             = Gson()
 private val exerciseListType = object : com.google.gson.reflect.TypeToken<List<Exercise>>() {}.type
 
+// --- Hilfsfunktionen ---
+
 fun isCurrentWeek(timestamp: Long): Boolean {
-    val cal = Calendar.getInstance()
+    val cal         = Calendar.getInstance()
     val currentWeek = cal.get(Calendar.WEEK_OF_YEAR)
     val currentYear = cal.get(Calendar.YEAR)
-    val targetCal = Calendar.getInstance()
+    val targetCal   = Calendar.getInstance()
     targetCal.timeInMillis = timestamp
-    return currentWeek == targetCal.get(Calendar.WEEK_OF_YEAR) && currentYear == targetCal.get(Calendar.YEAR)
+    return currentWeek == targetCal.get(Calendar.WEEK_OF_YEAR) &&
+            currentYear  == targetCal.get(Calendar.YEAR)
 }
 
 fun getDurationMillis(session: WorkoutSession): Long {
     val sdf = SimpleDateFormat("HH:mm", Locale.GERMAN)
     return try {
         val start = sdf.parse(session.startTime)?.time ?: 0L
-        val end = sdf.parse(session.endTime)?.time ?: 0L
-        var diff = end - start
+        val end   = sdf.parse(session.endTime)?.time   ?: 0L
+        var diff  = end - start
         if (diff < 0) diff += MILLIS_PER_DAY
         diff
     } catch (e: Exception) { 0L }
@@ -130,36 +133,34 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
-        setContent {
-            FitnessTrackerApp()
-        }
+        setContent { FitnessTrackerApp() }
     }
 }
 
 @Composable
 fun FitnessTrackerApp() {
     val context = LocalContext.current
-    val db = remember { AppDatabase.getDatabase(context) }
-    val dao = db.fitnessDao()
-    val scope = rememberCoroutineScope()
+    val db      = remember { AppDatabase.getDatabase(context) }
+    val dao     = db.fitnessDao()
+    val scope   = rememberCoroutineScope()
 
-    var selectedTab by remember { mutableIntStateOf(0) }
-    val workouts = remember { mutableStateListOf<String>() }
-    val exercisesPerWorkout = remember { mutableStateMapOf<String, List<Exercise>>() }
-    val workoutHistory = remember { mutableStateListOf<WorkoutSession>() }
-    var planName by remember { mutableStateOf("Mein Plan") }
-    var unitsPerWeek by remember { mutableIntStateOf(4) }
-    val sessionStartTimes = remember { mutableStateMapOf<String, Long>() }
+    var selectedTab          by remember { mutableIntStateOf(0) }
+    val workouts             = remember { mutableStateListOf<String>() }
+    val exercisesPerWorkout  = remember { mutableStateMapOf<String, List<Exercise>>() }
+    val workoutHistory       = remember { mutableStateListOf<WorkoutSession>() }
+    var planName             by remember { mutableStateOf("Mein Plan") }
+    var unitsPerWeek         by remember { mutableIntStateOf(4) }
+    val sessionStartTimes    = remember { mutableStateMapOf<String, Long>() }
+    var saveJob              by remember { mutableStateOf<Job?>(null) }
 
     LaunchedEffect(Unit) {
-        // FIX: try/catch um DB-Fehler beim Start abzufangen (Disk full, korrupte DB etc.)
         try {
-            val templates = dao.getAllTemplates()
+            val templates       = dao.getAllTemplates()
             val historyEntities = dao.getAllHistory()
 
             if (templates.isEmpty() && historyEntities.isEmpty()) {
                 val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                val json = prefs.getString(KEY_ALL_DATA, null)
+                val json  = prefs.getString(KEY_ALL_DATA, null)
                 if (json != null) {
                     try {
                         val legacyData = gson.fromJson(json, AppData::class.java)
@@ -171,7 +172,7 @@ fun FitnessTrackerApp() {
                             dao.insertSession(WorkoutSessionEntity(name = s.name, date = s.date, startTime = s.startTime, endTime = s.endTime, exercisesJson = gson.toJson(s.exercises), timestamp = s.timestamp))
                         }
                         prefs.edit().remove(KEY_ALL_DATA).apply()
-                    } catch (e: Exception) { /* Legacy-Migration fehlgeschlagen, ignorieren */ }
+                    } catch (e: Exception) { }
                 } else {
                     listOf("Push", "Pull", "Legs").forEachIndexed { i, n ->
                         dao.insertTemplate(WorkoutTemplateEntity(n, "[]", i))
@@ -191,20 +192,20 @@ fun FitnessTrackerApp() {
                 WorkoutSession(h.id, h.name, h.date, h.startTime, h.endTime, gson.fromJson(h.exercisesJson, exerciseListType), h.timestamp)
             })
             dao.getSettings()?.let { planName = it.planName; unitsPerWeek = it.unitsPerWeek }
-        } catch (e: Exception) { /* DB-Startfehler – App zeigt leeren Zustand */ }
+        } catch (e: Exception) { }
     }
 
     val triggerSave: () -> Unit = {
-        // Snapshot der aktuellen Werte für den IO-Thread
-        val currentPlanName = planName
-        val currentUnitsPerWeek = unitsPerWeek
-        val workoutsSnapshot = workouts.toList()
-        val exercisesSnapshot = exercisesPerWorkout.toMap()
-
-        scope.launch(Dispatchers.IO) {
-            dao.saveSettings(SettingsEntity(planName = currentPlanName, unitsPerWeek = currentUnitsPerWeek))
-            workoutsSnapshot.forEachIndexed { i, n ->
-                dao.insertTemplate(WorkoutTemplateEntity(n, gson.toJson(exercisesSnapshot[n] ?: emptyList<Exercise>()), i))
+        val snap1 = planName
+        val snap2 = unitsPerWeek
+        val snap3 = workouts.toList()
+        val snap4 = exercisesPerWorkout.toMap()
+        saveJob?.cancel()
+        saveJob = scope.launch(Dispatchers.IO) {
+            delay(SAVE_DEBOUNCE_MS)
+            dao.saveSettings(SettingsEntity(planName = snap1, unitsPerWeek = snap2))
+            snap3.forEachIndexed { i, n ->
+                dao.insertTemplate(WorkoutTemplateEntity(n, gson.toJson(snap4[n] ?: emptyList<Exercise>()), i))
             }
         }
     }
@@ -212,13 +213,9 @@ fun FitnessTrackerApp() {
     val onUpdateSession: (WorkoutSession) -> Unit = { updated ->
         scope.launch(Dispatchers.IO) {
             dao.insertSession(WorkoutSessionEntity(
-                id = updated.id,
-                name = updated.name,
-                date = updated.date,
-                startTime = updated.startTime,
-                endTime = updated.endTime,
-                exercisesJson = gson.toJson(updated.exercises),
-                timestamp = updated.timestamp
+                id = updated.id, name = updated.name, date = updated.date,
+                startTime = updated.startTime, endTime = updated.endTime,
+                exercisesJson = gson.toJson(updated.exercises), timestamp = updated.timestamp
             ))
             withContext(Dispatchers.Main) {
                 val idx = workoutHistory.indexOfFirst { it.id == updated.id }
@@ -238,24 +235,22 @@ fun FitnessTrackerApp() {
         Box(modifier = Modifier.padding(padding)) {
             if (selectedTab == 0) {
                 TrainingScreen(
-                    workouts = workouts,
+                    workouts            = workouts,
                     exercisesPerWorkout = exercisesPerWorkout,
-                    sessionStartTimes = sessionStartTimes,
-                    onDataChange = triggerSave,
-                    onFinishSession = { workoutName ->
+                    sessionStartTimes   = sessionStartTimes,
+                    onDataChange        = triggerSave,
+                    onFinishSession     = { workoutName ->
                         val startTime = sessionStartTimes[workoutName] ?: return@TrainingScreen
-                        val endTime = System.currentTimeMillis()
-                        val sdfD = SimpleDateFormat("dd. MMMM yyyy", Locale.GERMAN)
-                        val sdfT = SimpleDateFormat("HH:mm", Locale.GERMAN)
+                        val endTime   = System.currentTimeMillis()
+                        val sdfD      = SimpleDateFormat("dd. MMMM yyyy", Locale.GERMAN)
+                        val sdfT      = SimpleDateFormat("HH:mm", Locale.GERMAN)
                         val currentEx = exercisesPerWorkout[workoutName] ?: emptyList()
 
-                        // FIX: Session-Daten und Reset-State VOR dem Coroutine-Launch snapshot-en,
-                        // damit triggerSave() den bereits zurückgesetzten State speichert
                         val sessionToSave = WorkoutSession(
-                            name = workoutName,
-                            date = sdfD.format(Date(endTime)),
+                            name      = workoutName,
+                            date      = sdfD.format(Date(endTime)),
                             startTime = sdfT.format(Date(startTime)),
-                            endTime = sdfT.format(Date(endTime)),
+                            endTime   = sdfT.format(Date(endTime)),
                             exercises = currentEx.map { it.copy(sets = it.sets.filter { s -> s.currentKg.isNotEmpty() }) },
                             timestamp = endTime
                         )
@@ -265,30 +260,24 @@ fun FitnessTrackerApp() {
                             })
                         }
 
-                        // State sofort zurücksetzen (UI reagiert ohne auf DB zu warten)
                         sessionStartTimes.remove(workoutName)
                         exercisesPerWorkout[workoutName] = resetExercises
 
                         scope.launch(Dispatchers.IO) {
                             try {
-                                val id = dao.insertSession(
-                                    WorkoutSessionEntity(
-                                        name = sessionToSave.name,
-                                        date = sessionToSave.date,
-                                        startTime = sessionToSave.startTime,
-                                        endTime = sessionToSave.endTime,
-                                        exercisesJson = gson.toJson(sessionToSave.exercises),
-                                        timestamp = sessionToSave.timestamp
-                                    )
-                                )
-                                // Templates mit bereits gesetztem Reset-State speichern
+                                val id = dao.insertSession(WorkoutSessionEntity(
+                                    name = sessionToSave.name, date = sessionToSave.date,
+                                    startTime = sessionToSave.startTime, endTime = sessionToSave.endTime,
+                                    exercisesJson = gson.toJson(sessionToSave.exercises),
+                                    timestamp = sessionToSave.timestamp
+                                ))
                                 workouts.toList().forEachIndexed { i, n ->
                                     dao.insertTemplate(WorkoutTemplateEntity(n, gson.toJson(exercisesPerWorkout[n] ?: emptyList<Exercise>()), i))
                                 }
                                 withContext(Dispatchers.Main) {
                                     workoutHistory.add(0, sessionToSave.copy(id = id))
                                 }
-                            } catch (e: Exception) { /* DB-Fehler beim Speichern */ }
+                            } catch (e: Exception) { }
                         }
                     },
                     onDeleteWorkout = { name ->
@@ -315,67 +304,83 @@ fun TrainingScreen(
     onDeleteWorkout: (String) -> Unit
 ) {
     var activeIdx by remember { mutableIntStateOf(0) }
-    var showAddW by remember { mutableStateOf(false) }; var newWN by remember { mutableStateOf("") }
+    var showAddW  by remember { mutableStateOf(false) }; var newWN by remember { mutableStateOf("") }
     var showAddEx by remember { mutableStateOf(false) }; var newEN by remember { mutableStateOf("") }
-    var editIdx by remember { mutableStateOf<Int?>(null) }; var showOpt by remember { mutableStateOf(false) }
-    var showRen by remember { mutableStateOf(false) }; var renV by remember { mutableStateOf("") }
+    var editIdx   by remember { mutableStateOf<Int?>(null) }
+    var showOpt   by remember { mutableStateOf(false) }
+    var showRen   by remember { mutableStateOf(false) }; var renV by remember { mutableStateOf("") }
 
-    // FIX: activeIdx auf gültigen Bereich begrenzen falls workouts sich ändert
     val safeActiveIdx = activeIdx.coerceIn(0, (workouts.size - 1).coerceAtLeast(0))
     if (safeActiveIdx != activeIdx) activeIdx = safeActiveIdx
 
     val activeName = workouts.getOrNull(activeIdx) ?: ""
-    val currentEx = exercisesPerWorkout[activeName] ?: emptyList()
+
+    // FIX Scroll-Performance: derivedStateOf liest exercisesPerWorkout nur dann neu,
+    // wenn sich die Liste für das aktive Workout tatsächlich geändert hat.
+    // Ohne dies registriert jede Komposition die gesamte Map als Abhängigkeit →
+    // jede Änderung an einem beliebigen Workout invalidiert die ganze LazyColumn.
+    val currentEx by remember(activeName) {
+        derivedStateOf { exercisesPerWorkout[activeName] ?: emptyList() }
+    }
 
     if (showAddW) {
         AlertDialog(
             onDismissRequest = { showAddW = false },
             title = { Text("Neues Training") },
-            text = { TextField(newWN, { newWN = it }, placeholder = { Text("Name") }, modifier = Modifier.fillMaxWidth()) },
-            confirmButton = { TextButton(onClick = { if (newWN.isNotBlank()) { workouts.add(newWN); exercisesPerWorkout[newWN] = emptyList(); activeIdx = workouts.size - 1; newWN = ""; showAddW = false; onDataChange() } }) { Text("Hinzufügen") } },
+            text  = { TextField(newWN, { newWN = it }, placeholder = { Text("Name") }, modifier = Modifier.fillMaxWidth()) },
+            confirmButton = { TextButton(onClick = {
+                if (newWN.isNotBlank()) { workouts.add(newWN); exercisesPerWorkout[newWN] = emptyList(); activeIdx = workouts.size - 1; newWN = ""; showAddW = false; onDataChange() }
+            }) { Text("Hinzufügen") } },
             dismissButton = { TextButton(onClick = { showAddW = false }) { Text("Abbrechen") } }
         )
     }
-
     if (showOpt && editIdx != null) {
         val name = workouts[editIdx!!]
         AlertDialog(
             onDismissRequest = { showOpt = false },
             title = { Text("Training: $name") },
-            text = { Text("Umbenennen oder löschen?") },
+            text  = { Text("Umbenennen oder löschen?") },
             confirmButton = { TextButton(onClick = { renV = name; showOpt = false; showRen = true }) { Text("Umbenennen") } },
             dismissButton = { TextButton(onClick = {
                 val removed = workouts.removeAt(editIdx!!)
-                exercisesPerWorkout.remove(removed)
-                onDeleteWorkout(removed)
+                exercisesPerWorkout.remove(removed); onDeleteWorkout(removed)
                 activeIdx = activeIdx.coerceIn(0, (workouts.size - 1).coerceAtLeast(0))
-                showOpt = false
-                onDataChange()
+                showOpt = false; onDataChange()
             }, colors = ButtonDefaults.textButtonColors(contentColor = Color.Red)) { Text("Löschen") } }
         )
     }
-
     if (showRen && editIdx != null) {
         AlertDialog(
             onDismissRequest = { showRen = false },
             title = { Text("Umbenennen") },
-            text = { TextField(renV, { renV = it }, modifier = Modifier.fillMaxWidth()) },
-            confirmButton = { TextButton(onClick = { if (renV.isNotBlank()) { val old = workouts[editIdx!!]; workouts[editIdx!!] = renV; exercisesPerWorkout[renV] = exercisesPerWorkout.remove(old) ?: emptyList(); showRen = false; onDataChange() } }) { Text("Speichern") } },
+            text  = { TextField(renV, { renV = it }, modifier = Modifier.fillMaxWidth()) },
+            confirmButton = { TextButton(onClick = {
+                if (renV.isNotBlank()) {
+                    val old = workouts[editIdx!!]; workouts[editIdx!!] = renV
+                    exercisesPerWorkout[renV] = exercisesPerWorkout.remove(old) ?: emptyList()
+                    showRen = false; onDataChange()
+                }
+            }) { Text("Speichern") } },
             dismissButton = { TextButton(onClick = { showRen = false }) { Text("Abbrechen") } }
         )
     }
-
     if (showAddEx) {
         AlertDialog(
             onDismissRequest = { showAddEx = false },
             title = { Text("Neue Übung") },
-            text = { TextField(newEN, { newEN = it }, placeholder = { Text("Übungsname") }, modifier = Modifier.fillMaxWidth()) },
-            confirmButton = { TextButton(onClick = { if (newEN.isNotBlank()) { exercisesPerWorkout[activeName] = currentEx + Exercise(newEN, sets = listOf(WorkoutSet("", "", "", ""))); newEN = ""; showAddEx = false; onDataChange() } }) { Text("Hinzufügen") } },
+            text  = { TextField(newEN, { newEN = it }, placeholder = { Text("Übungsname") }, modifier = Modifier.fillMaxWidth()) },
+            confirmButton = { TextButton(onClick = {
+                if (newEN.isNotBlank()) {
+                    exercisesPerWorkout[activeName] = currentEx + Exercise(newEN, sets = listOf(WorkoutSet("", "", "", "")))
+                    newEN = ""; showAddEx = false; onDataChange()
+                }
+            }) { Text("Hinzufügen") } },
             dismissButton = { TextButton(onClick = { showAddEx = false }) { Text("Abbrechen") } }
         )
     }
 
     Column(modifier = Modifier.fillMaxSize().background(BackgroundColor)) {
+        // Header
         Column(modifier = Modifier.fillMaxWidth().background(BluePrimary).padding(16.dp)) {
             Text(text = activeName, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(16.dp))
@@ -392,74 +397,86 @@ fun TrainingScreen(
             }
         }
 
-        // FIX Scroll-Ruckeln: key() für stabile Item-Identität in der LazyColumn.
-        // Ohne key() ersetzt Compose bei jeder State-Änderung alle Items neu →
-        // sichtbares Ruckeln. Mit key(ex.name) werden nur geänderte Items neu gezeichnet.
+        // FIX Scroll-Performance: Callbacks mit remember(activeName, currentEx) stabilisieren.
+        // Neue Lambda-Instanzen bei jedem Recompose gelten für Compose als "geänderte Parameter"
+        // → alle ExerciseCards werden neu gezeichnet, auch wenn sich nichts geändert hat.
+        // Mit remember werden dieselben Instanzen wiederverwendet solange activeName/currentEx gleich bleiben.
+        val onExerciseChange: (Int, Exercise) -> Unit = remember(activeName, currentEx) {
+            { idx, updated ->
+                if (!sessionStartTimes.containsKey(activeName)) {
+                    sessionStartTimes[activeName] = System.currentTimeMillis()
+                }
+                val nl = currentEx.toMutableList(); nl[idx] = updated
+                exercisesPerWorkout[activeName] = nl
+                onDataChange()
+            }
+        }
+        val onExerciseDelete: (Int) -> Unit = remember(activeName, currentEx) {
+            { idx ->
+                val nl = currentEx.toMutableList(); nl.removeAt(idx)
+                exercisesPerWorkout[activeName] = nl; onDataChange()
+            }
+        }
+        val onExerciseRename: (Int, String) -> Unit = remember(activeName, currentEx) {
+            { idx, name ->
+                val nl = currentEx.toMutableList(); nl[idx] = currentEx[idx].copy(name = name)
+                exercisesPerWorkout[activeName] = nl; onDataChange()
+            }
+        }
+        val onMoveUp: (Int) -> Unit = remember(activeName, currentEx) {
+            { idx ->
+                if (idx > 0) {
+                    val nl = currentEx.toMutableList()
+                    val tmp = nl[idx]; nl[idx] = nl[idx - 1]; nl[idx - 1] = tmp
+                    exercisesPerWorkout[activeName] = nl; onDataChange()
+                }
+            }
+        }
+        val onMoveDown: (Int) -> Unit = remember(activeName, currentEx) {
+            { idx ->
+                if (idx < currentEx.size - 1) {
+                    val nl = currentEx.toMutableList()
+                    val tmp = nl[idx]; nl[idx] = nl[idx + 1]; nl[idx + 1] = tmp
+                    exercisesPerWorkout[activeName] = nl; onDataChange()
+                }
+            }
+        }
+
         LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(16.dp),
+            modifier        = Modifier.fillMaxSize(),
+            contentPadding  = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             item { Text("ÜBUNGEN", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray) }
+
+            // key(ex.name): stabile Item-Identität → Compose zeichnet nur die tatsächlich
+            // geänderte Card neu, nicht alle sichtbaren Items auf einmal.
             itemsIndexed(currentEx, key = { _, ex -> ex.name }) { i, ex ->
-                // FIX: activeName als captured val für stabile Lambda-Referenz
-                val capturedName = activeName
+                // FIX Scroll-Performance: ExerciseCard in separater Composable-Funktion mit
+                // stabilen Parametern. Compose kann dadurch den Recomposition-Scope auf die
+                // einzelne Card beschränken ("smart recomposition") statt die ganze Liste neu
+                // zu zeichnen.
                 ExerciseCard(
-                    ex = ex,
-                    onChange = { up ->
-                        if (!sessionStartTimes.containsKey(capturedName)) {
-                            sessionStartTimes[capturedName] = System.currentTimeMillis()
-                        }
-                        val nl = currentEx.toMutableList()
-                        nl[i] = up
-                        exercisesPerWorkout[capturedName] = nl
-                        onDataChange()
-                    },
-                    onDel = {
-                        val nl = currentEx.toMutableList()
-                        nl.removeAt(i)
-                        exercisesPerWorkout[capturedName] = nl
-                        onDataChange()
-                    },
-                    onRen = { n ->
-                        val nl = currentEx.toMutableList()
-                        nl[i] = ex.copy(name = n)
-                        exercisesPerWorkout[capturedName] = nl
-                        onDataChange()
-                    },
-                    onMoveUp = if (i > 0) {
-                        {
-                            val nl = currentEx.toMutableList()
-                            val temp = nl[i]; nl[i] = nl[i - 1]; nl[i - 1] = temp
-                            exercisesPerWorkout[capturedName] = nl
-                            onDataChange()
-                        }
-                    } else null,
-                    onMoveDown = if (i < currentEx.size - 1) {
-                        {
-                            val nl = currentEx.toMutableList()
-                            val temp = nl[i]; nl[i] = nl[i + 1]; nl[i + 1] = temp
-                            exercisesPerWorkout[capturedName] = nl
-                            onDataChange()
-                        }
-                    } else null
+                    ex         = ex,
+                    onChange   = { up -> onExerciseChange(i, up) },
+                    onDel      = { onExerciseDelete(i) },
+                    onRen      = { n -> onExerciseRename(i, n) },
+                    onMoveUp   = if (i > 0)                  { { onMoveUp(i) }   } else null,
+                    onMoveDown = if (i < currentEx.size - 1) { { onMoveDown(i) } } else null
                 )
             }
+
             item {
-                Button(
-                    onClick = { showAddEx = true },
-                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                Button(onClick = { showAddEx = true }, Modifier.fillMaxWidth().height(48.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
-                    border = BorderStroke(1.dp, BluePrimary)
-                ) { Text("+ Neue Übung", color = BluePrimary) }
+                    border = BorderStroke(1.dp, BluePrimary)) {
+                    Text("+ Neue Übung", color = BluePrimary)
+                }
             }
             if (currentEx.isNotEmpty()) {
                 item {
-                    Button(
-                        onClick = { onFinishSession(activeName) },
-                        modifier = Modifier.fillMaxWidth().height(60.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
-                    ) {
+                    Button(onClick = { onFinishSession(activeName) }, Modifier.fillMaxWidth().height(60.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
                             Text("Einheit beenden", color = Color.White, fontWeight = FontWeight.Bold)
                             Spacer(Modifier.width(8.dp))
@@ -481,19 +498,19 @@ fun ExerciseCard(
     onMoveUp: (() -> Unit)? = null,
     onMoveDown: (() -> Unit)? = null
 ) {
-    var menu by remember { mutableStateOf(false) }
-    var ren by remember { mutableStateOf(false) }
-    var rVal by remember { mutableStateOf(ex.name) }
+    var menu       by remember { mutableStateOf(false) }
+    var ren        by remember { mutableStateOf(false) }
+    var rVal       by remember { mutableStateOf(ex.name) }
     var descDialog by remember { mutableStateOf(false) }
-    var dVal by remember { mutableStateOf(ex.description ?: "") }
-    var showDesc by remember { mutableStateOf(false) }
+    var dVal       by remember { mutableStateOf(ex.description ?: "") }
+    var showDesc   by remember { mutableStateOf(false) }
     val description = ex.description ?: ""
 
     if (ren) {
         AlertDialog(
             onDismissRequest = { ren = false },
             title = { Text("Übung umbenennen") },
-            text = { TextField(rVal, { rVal = it }, modifier = Modifier.fillMaxWidth()) },
+            text  = { TextField(rVal, { rVal = it }, modifier = Modifier.fillMaxWidth()) },
             confirmButton = { TextButton(onClick = { onRen(rVal); ren = false }) { Text("Speichern") } },
             dismissButton = { TextButton(onClick = { ren = false }) { Text("Abbrechen") } }
         )
@@ -502,13 +519,16 @@ fun ExerciseCard(
         AlertDialog(
             onDismissRequest = { descDialog = false },
             title = { Text("Beschreibung") },
-            text = { TextField(dVal, { dVal = it }, placeholder = { Text("Z.B. Sitzhöhe 3, Fokus auf Dehnung...") }, modifier = Modifier.fillMaxWidth(), minLines = 3) },
+            text  = { TextField(dVal, { dVal = it }, placeholder = { Text("Z.B. Sitzhöhe 3, Fokus auf Dehnung...") }, modifier = Modifier.fillMaxWidth(), minLines = 3) },
             confirmButton = { TextButton(onClick = { onChange(ex.copy(description = dVal)); descDialog = false }) { Text("Speichern") } },
             dismissButton = { TextButton(onClick = { descDialog = false }) { Text("Abbrechen") } }
         )
     }
 
-    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
+    Card(Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = CardBackground),
+        border = BorderStroke(1.dp, BorderColor)
+    ) {
         Column(Modifier.padding(12.dp)) {
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                 Column(Modifier.weight(1f).clickable { showDesc = !showDesc }) {
@@ -521,34 +541,33 @@ fun ExerciseCard(
                     IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, null) }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(text = { Text("Satz hinzufügen") }, onClick = {
-                            onChange(ex.copy(sets = ex.sets + WorkoutSet("", "", "", "")))
-                            menu = false
+                            onChange(ex.copy(sets = ex.sets + WorkoutSet("", "", "", ""))); menu = false
                         }, leadingIcon = { Icon(Icons.Default.Add, null) })
-                        if (onMoveUp != null) {
-                            DropdownMenuItem(text = { Text("Nach oben verschieben") }, onClick = { onMoveUp(); menu = false }, leadingIcon = { Icon(Icons.Default.KeyboardArrowUp, null) })
-                        }
-                        if (onMoveDown != null) {
-                            DropdownMenuItem(text = { Text("Nach unten verschieben") }, onClick = { onMoveDown(); menu = false }, leadingIcon = { Icon(Icons.Default.KeyboardArrowDown, null) })
-                        }
-                        DropdownMenuItem(text = { Text("Beschreibung") }, onClick = { menu = false; showDesc = !showDesc }, leadingIcon = { Icon(Icons.Default.Info, null) })
+                        if (onMoveUp != null)   DropdownMenuItem(text = { Text("Nach oben verschieben") },   onClick = { onMoveUp();   menu = false }, leadingIcon = { Icon(Icons.Default.KeyboardArrowUp, null) })
+                        if (onMoveDown != null) DropdownMenuItem(text = { Text("Nach unten verschieben") }, onClick = { onMoveDown(); menu = false }, leadingIcon = { Icon(Icons.Default.KeyboardArrowDown, null) })
+                        DropdownMenuItem(text = { Text("Beschreibung") },            onClick = { menu = false; showDesc = !showDesc },         leadingIcon = { Icon(Icons.Default.Info, null) })
                         DropdownMenuItem(text = { Text("Beschreibung bearbeiten") }, onClick = { menu = false; dVal = description; descDialog = true }, leadingIcon = { Icon(Icons.Default.Edit, null) })
-                        DropdownMenuItem(text = { Text("Umbenennen") }, onClick = { menu = false; rVal = ex.name; ren = true }, leadingIcon = { Icon(Icons.Default.Edit, null) })
-                        DropdownMenuItem(text = { Text("Löschen") }, onClick = { menu = false; onDel() }, leadingIcon = { Icon(Icons.Default.Delete, null, tint = Color.Red) })
+                        DropdownMenuItem(text = { Text("Umbenennen") },              onClick = { menu = false; rVal = ex.name; ren = true },   leadingIcon = { Icon(Icons.Default.Edit, null) })
+                        DropdownMenuItem(text = { Text("Löschen") },                 onClick = { menu = false; onDel() },                      leadingIcon = { Icon(Icons.Default.Delete, null, tint = Color.Red) })
                     }
                 }
             }
+
             Spacer(Modifier.height(12.dp))
-            // FIX Scroll-Ruckeln: key(i) für stabile SetCard-Identität in der LazyRow
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                itemsIndexed(ex.sets, key = { i, _ -> i }) { i, s ->
-                    SetCard(i, s) { up ->
+
+            // Row + horizontalScroll statt LazyRow: verschachtelte Lazy-Layouts verursachen
+            // bei jedem Scroll-Frame teure Layout-Neuberechnungen. Da pro Übung max. ~8 Sätze
+            // existieren ist Virtualisierung unnötig — normales Row ist hier deutlich schneller.
+            Row(
+                modifier            = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                ex.sets.forEachIndexed { i, s ->
+                    SetCard(idx = i, s = s) { up ->
                         val ns = ex.sets.toMutableList()
                         ns[i] = up
-                        // Leere Auto-Sätze am Ende entfernen wenn vorletzter Satz geleert wird
-                        if (i == ns.size - 1 && up.currentKg.isNotEmpty() || up.currentReps.isNotEmpty()) {
-                            if (i == ns.size - 1 && (up.currentKg.isNotEmpty() || up.currentReps.isNotEmpty())) {
-                                ns.add(WorkoutSet("", "", "", ""))
-                            }
+                        if (i == ns.size - 1 && (up.currentKg.isNotEmpty() || up.currentReps.isNotEmpty())) {
+                            ns.add(WorkoutSet("", "", "", ""))
                         }
                         onChange(ex.copy(sets = ns))
                     }
@@ -569,15 +588,15 @@ fun SetCard(idx: Int, s: WorkoutSet, onChange: (WorkoutSet) -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Surface(
-            color = if (s.isDone) BluePrimary else BluePrimary.copy(0.1f),
-            shape = RoundedCornerShape(16.dp),
+            color    = if (s.isDone) BluePrimary else BluePrimary.copy(0.1f),
+            shape    = RoundedCornerShape(16.dp),
             modifier = Modifier.clickable { onChange(s.copy(isDone = !s.isDone)) }
         ) {
             Text(
-                text = if (s.currentKg.isEmpty()) "Satz ${idx + 1}" else "${s.currentKg}kg x ${s.currentReps}",
-                color = if (s.isDone) Color.White else BluePrimary,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                text       = if (s.currentKg.isEmpty()) "Satz ${idx + 1}" else "${s.currentKg}kg x ${s.currentReps}",
+                color      = if (s.isDone) Color.White else BluePrimary,
+                fontSize   = 11.sp,
+                modifier   = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
                 fontWeight = FontWeight.Bold
             )
         }
@@ -600,12 +619,12 @@ fun SetCard(idx: Int, s: WorkoutSet, onChange: (WorkoutSet) -> Unit) {
 @Composable
 fun SetInputField(v: String, onVal: (String) -> Unit) {
     BasicTextField(
-        value = v,
-        onValueChange = onVal,
-        textStyle = TextStyle(textAlign = TextAlign.Center, fontWeight = FontWeight.Bold),
+        value           = v,
+        onValueChange   = onVal,
+        textStyle       = TextStyle(textAlign = TextAlign.Center, fontWeight = FontWeight.Bold),
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-        modifier = Modifier.background(Color(0xFFF5F5F5), RoundedCornerShape(4.dp)).padding(4.dp),
-        singleLine = true
+        modifier        = Modifier.background(Color(0xFFF5F5F5), RoundedCornerShape(4.dp)).padding(4.dp),
+        singleLine      = true
     )
 }
 
@@ -624,34 +643,29 @@ fun StatisticsScreen(
     onUpdateSession: (WorkoutSession) -> Unit
 ) {
     var editing by remember { mutableStateOf(false) }
-    var selS by remember { mutableStateOf<WorkoutSession?>(null) }
-    var selEx by remember { mutableStateOf<String?>(null) }
-    var tRange by remember { mutableStateOf(TimeRange.LAST_30_DAYS) }
-    var menu by remember { mutableStateOf(false) }
+    var selS    by remember { mutableStateOf<WorkoutSession?>(null) }
+    var selEx   by remember { mutableStateOf<String?>(null) }
+    var tRange  by remember { mutableStateOf(TimeRange.LAST_30_DAYS) }
+    var menu    by remember { mutableStateOf(false) }
 
     val filtered = remember(history, tRange) {
-        val now = System.currentTimeMillis()
-        val cal = Calendar.getInstance()
+        val now = System.currentTimeMillis(); val cal = Calendar.getInstance()
         history.filter {
             when (tRange) {
-                TimeRange.LAST_7_DAYS -> it.timestamp > now - MILLIS_7_DAYS
+                TimeRange.LAST_7_DAYS  -> it.timestamp > now - MILLIS_7_DAYS
                 TimeRange.LAST_30_DAYS -> it.timestamp > now - MILLIS_30_DAYS
-                TimeRange.THIS_YEAR -> {
-                    cal.timeInMillis = now; val y = cal.get(Calendar.YEAR)
-                    cal.timeInMillis = it.timestamp; cal.get(Calendar.YEAR) == y
-                }
-                TimeRange.ALL -> true
+                TimeRange.THIS_YEAR    -> { cal.timeInMillis = now; val y = cal.get(Calendar.YEAR); cal.timeInMillis = it.timestamp; cal.get(Calendar.YEAR) == y }
+                TimeRange.ALL          -> true
             }
         }
     }
     val totalTime = filtered.sumOf { getDurationMillis(it) }
-    val h = totalTime / 3_600_000
-    val m = (totalTime / 60_000) % 60
+    val h = totalTime / 3_600_000; val m = (totalTime / 60_000) % 60
     val uniqueEx = remember(filtered, exercisesPerWorkout) {
         (exercisesPerWorkout.values.flatten().map { it.name } + filtered.flatMap { it.exercises }.map { it.name }).distinct().sorted()
     }
 
-    if (selS != null) SessionDetailDialog(selS!!, onUpdateSession) { selS = null }
+    if (selS  != null) SessionDetailDialog(selS!!, onUpdateSession) { selS = null }
     if (selEx != null) ExerciseProgressDialog(selEx!!, history) { selEx = null }
 
     Column(Modifier.fillMaxSize().background(BackgroundColor).padding(16.dp).verticalScroll(rememberScrollState())) {
@@ -672,8 +686,7 @@ fun StatisticsScreen(
         }
         Card(Modifier.fillMaxWidth().padding(top = 16.dp), colors = CardDefaults.cardColors(containerColor = CardBackground), border = BorderStroke(1.dp, BorderColor)) {
             Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.PlayArrow, null, tint = BluePrimary)
-                Spacer(Modifier.width(16.dp))
+                Icon(Icons.Default.PlayArrow, null, tint = BluePrimary); Spacer(Modifier.width(16.dp))
                 Column {
                     Text("Gesamtzeit im Studio", fontSize = 12.sp, color = DarkGray)
                     Text(if (h > 0) "${h}h ${m}m" else "${m}m", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = BluePrimary)
@@ -732,69 +745,47 @@ fun StatisticsScreen(
 }
 
 @Composable
-fun LineChart(
-    data: List<Double>,
-    modifier: Modifier = Modifier,
-    lineColor: Color = BluePrimary
-) {
+fun LineChart(data: List<Double>, modifier: Modifier = Modifier, lineColor: Color = BluePrimary) {
     if (data.size < 2) {
         Box(modifier = modifier.background(Color(0xFFF5F5F5), RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) {
             Text("Nicht genügend Daten für den Graph", fontSize = 12.sp, color = Color.Gray)
         }
         return
     }
-
     val minVal = (data.minOrNull() ?: 0.0).toFloat()
     val maxVal = (data.maxOrNull() ?: 0.0).toFloat()
-    val range = if (maxVal == minVal) 1f else maxVal - minVal
-    val leftPadding = 80f
+    val range  = if (maxVal == minVal) 1f else maxVal - minVal
+    val leftPadding    = 80f
     val verticalPadding = 40f
 
     Canvas(modifier = modifier) {
         val chartHeight = size.height - 2 * verticalPadding
-        val chartWidth = size.width - leftPadding - 20f
-        val gridLines = 4
-
+        val chartWidth  = size.width - leftPadding - 20f
+        val gridLines   = 4
         for (i in 0..gridLines) {
-            val y = size.height - verticalPadding - (i * chartHeight / gridLines)
+            val y     = size.height - verticalPadding - (i * chartHeight / gridLines)
             val value = minVal + (i * (maxVal - minVal) / gridLines)
             drawLine(color = Color.LightGray.copy(alpha = 0.5f), start = Offset(leftPadding, y), end = Offset(size.width, y), strokeWidth = 1.dp.toPx())
             drawContext.canvas.nativeCanvas.drawText("${String.format("%.1f", value)} kg", 10f, y + 10f, android.graphics.Paint().apply { color = android.graphics.Color.GRAY; textSize = 24f })
         }
-
         val spacing = chartWidth / (data.size - 1)
-        val points = data.mapIndexed { index, value ->
+        val points  = data.mapIndexed { index, value ->
             Offset(x = leftPadding + index * spacing, y = size.height - verticalPadding - ((value.toFloat() - minVal) / range * chartHeight))
         }
-
         val path = Path().apply {
             moveTo(points.first().x, points.first().y)
-            for (i in 1 until points.size) {
-                val p0 = points[i - 1]; val p1 = points[i]
-                cubicTo(p0.x + (p1.x - p0.x) / 2f, p0.y, p0.x + (p1.x - p0.x) / 2f, p1.y, p1.x, p1.y)
-            }
+            for (i in 1 until points.size) { val p0 = points[i-1]; val p1 = points[i]; cubicTo(p0.x+(p1.x-p0.x)/2f, p0.y, p0.x+(p1.x-p0.x)/2f, p1.y, p1.x, p1.y) }
         }
-
         val fillPath = android.graphics.Path().apply {
             moveTo(points.first().x, points.first().y)
-            for (i in 1 until points.size) {
-                val p0 = points[i - 1]; val p1 = points[i]
-                cubicTo(p0.x + (p1.x - p0.x) / 2f, p0.y, p0.x + (p1.x - p0.x) / 2f, p1.y, p1.x, p1.y)
-            }
-            lineTo(points.last().x, size.height - verticalPadding)
-            lineTo(points.first().x, size.height - verticalPadding)
-            close()
+            for (i in 1 until points.size) { val p0 = points[i-1]; val p1 = points[i]; cubicTo(p0.x+(p1.x-p0.x)/2f, p0.y, p0.x+(p1.x-p0.x)/2f, p1.y, p1.x, p1.y) }
+            lineTo(points.last().x, size.height - verticalPadding); lineTo(points.first().x, size.height - verticalPadding); close()
         }
-
         drawContext.canvas.nativeCanvas.drawPath(fillPath, android.graphics.Paint().apply {
             shader = android.graphics.LinearGradient(0f, points.minOf { it.y }, 0f, size.height - verticalPadding, lineColor.copy(alpha = 0.3f).toArgb(), Color.Transparent.toArgb(), android.graphics.Shader.TileMode.CLAMP)
         })
-
         drawPath(path = path, color = lineColor, style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
-        points.forEach { point ->
-            drawCircle(Color.White, radius = 4.dp.toPx(), center = point)
-            drawCircle(lineColor, radius = 2.dp.toPx(), center = point)
-        }
+        points.forEach { p -> drawCircle(Color.White, 4.dp.toPx(), p); drawCircle(lineColor, 2.dp.toPx(), p) }
     }
 }
 
@@ -802,14 +793,12 @@ fun LineChart(
 fun ExerciseProgressDialog(name: String, history: List<WorkoutSession>, onDismiss: () -> Unit) {
     var selectedMetric by remember { mutableStateOf(ProgressMetric.MAX_WEIGHT) }
     val data = remember(name, history) {
-        // FIX: history ist bereits chronologisch von der DB (neueste zuerst).
-        // asReversed() → älteste zuerst für den Chart. .reversed() in items() kehrt zurück → neueste zuerst für die Liste. Korrekt.
         history.asReversed().mapNotNull { s ->
             val ex = s.exercises.find { it.name == name }
             if (ex != null && ex.sets.any { it.currentKg.isNotEmpty() }) {
-                val max = ex.sets.mapNotNull { it.currentKg.toDoubleOrNull() }.maxOrNull() ?: 0.0
+                val max         = ex.sets.mapNotNull { it.currentKg.toDoubleOrNull() }.maxOrNull() ?: 0.0
                 val totalVolume = ex.sets.sumOf { (it.currentKg.toDoubleOrNull() ?: 0.0) * (it.currentReps.toDoubleOrNull() ?: 0.0) }
-                val bestSet1RM = ex.sets.mapNotNull { set ->
+                val bestSet1RM  = ex.sets.mapNotNull { set ->
                     val w = set.currentKg.toDoubleOrNull() ?: 0.0; val r = set.currentReps.toDoubleOrNull() ?: 0.0
                     if (r > 0) w * (1 + r / 30.0) else null
                 }.maxOrNull() ?: 0.0
@@ -828,21 +817,13 @@ fun ExerciseProgressDialog(name: String, history: List<WorkoutSession>, onDismis
                 }
                 ScrollableTabRow(selectedTabIndex = selectedMetric.ordinal, containerColor = Color.Transparent, edgePadding = 0.dp, divider = {}, indicator = {}) {
                     ProgressMetric.entries.forEach { metric ->
-                        Tab(
-                            selected = selectedMetric == metric,
-                            onClick = { selectedMetric = metric },
-                            text = { Text(metric.label, fontSize = 12.sp, color = if (selectedMetric == metric) BluePrimary else Color.Gray, fontWeight = if (selectedMetric == metric) FontWeight.Bold else FontWeight.Normal) }
-                        )
+                        Tab(selected = selectedMetric == metric, onClick = { selectedMetric = metric },
+                            text = { Text(metric.label, fontSize = 12.sp, color = if (selectedMetric == metric) BluePrimary else Color.Gray, fontWeight = if (selectedMetric == metric) FontWeight.Bold else FontWeight.Normal) })
                     }
                 }
                 Spacer(Modifier.height(16.dp))
-                if (chartPoints.size >= 2) {
-                    LineChart(data = chartPoints, modifier = Modifier.fillMaxWidth().height(180.dp))
-                } else {
-                    Box(Modifier.fillMaxWidth().height(180.dp).background(Color(0xFFF5F5F5), RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) {
-                        Text("Nicht genügend Datenpunkte", color = Color.Gray, fontSize = 12.sp)
-                    }
-                }
+                if (chartPoints.size >= 2) LineChart(data = chartPoints, modifier = Modifier.fillMaxWidth().height(180.dp))
+                else Box(Modifier.fillMaxWidth().height(180.dp).background(Color(0xFFF5F5F5), RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) { Text("Nicht genügend Datenpunkte", color = Color.Gray, fontSize = 12.sp) }
                 Text("Historie (${selectedMetric.label})", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray, modifier = Modifier.padding(top = 24.dp, bottom = 8.dp))
                 Divider()
                 LazyColumn(Modifier.weight(1f)) {
@@ -852,9 +833,7 @@ fun ExerciseProgressDialog(name: String, history: List<WorkoutSession>, onDismis
                                 Text(date, fontSize = 12.sp, color = Color.Gray)
                                 Text("${String.format("%.1f", metrics[selectedMetric])} ${selectedMetric.unit}", fontWeight = FontWeight.Bold)
                             }
-                            if (selectedMetric == ProgressMetric.MAX_WEIGHT) {
-                                Text("Vol: ${metrics[ProgressMetric.VOLUME]?.toInt()} kg", fontSize = 11.sp, color = BluePrimary.copy(0.7f))
-                            }
+                            if (selectedMetric == ProgressMetric.MAX_WEIGHT) Text("Vol: ${metrics[ProgressMetric.VOLUME]?.toInt()} kg", fontSize = 11.sp, color = BluePrimary.copy(0.7f))
                         }
                         Divider(color = BorderColor.copy(0.3f))
                     }
@@ -866,7 +845,7 @@ fun ExerciseProgressDialog(name: String, history: List<WorkoutSession>, onDismis
 
 @Composable
 fun SessionDetailDialog(s: WorkoutSession, onUpdate: (WorkoutSession) -> Unit, onDismiss: () -> Unit) {
-    var editMode by remember { mutableStateOf(false) }
+    var editMode      by remember { mutableStateOf(false) }
     var editedSession by remember { mutableStateOf(s) }
 
     Dialog(onDismissRequest = onDismiss) {
@@ -874,19 +853,14 @@ fun SessionDetailDialog(s: WorkoutSession, onUpdate: (WorkoutSession) -> Unit, o
             Column(modifier = Modifier.padding(16.dp)) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Top) {
                     Column(Modifier.weight(1f)) {
-                        if (editMode) {
-                            BasicTextField(editedSession.name, { editedSession = editedSession.copy(name = it) }, textStyle = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.Bold))
-                        } else {
-                            Text(s.name, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                        }
+                        if (editMode) BasicTextField(editedSession.name, { editedSession = editedSession.copy(name = it) }, textStyle = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.Bold))
+                        else Text(s.name, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                         Text(s.date, fontSize = 14.sp, color = DarkGray)
                         Text("${s.startTime} - ${s.endTime}", fontSize = 14.sp, color = DarkGray)
                     }
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, null) }
-                        IconButton(onClick = { editMode = !editMode }) {
-                            Icon(if (editMode) Icons.Default.Check else Icons.Default.Edit, null, tint = BluePrimary)
-                        }
+                        IconButton(onClick = { editMode = !editMode }) { Icon(if (editMode) Icons.Default.Check else Icons.Default.Edit, null, tint = BluePrimary) }
                     }
                 }
                 Spacer(Modifier.height(16.dp)); Divider()
@@ -900,18 +874,14 @@ fun SessionDetailDialog(s: WorkoutSession, onUpdate: (WorkoutSession) -> Unit, o
                                     if (editMode) {
                                         Row(verticalAlignment = Alignment.CenterVertically) {
                                             SetInputField(set.currentKg) { v ->
-                                                val newEx = editedSession.exercises.toMutableList()
-                                                val newSets = ex.sets.toMutableList()
-                                                newSets[setIdx] = set.copy(currentKg = v)
-                                                newEx[exIdx] = ex.copy(sets = newSets)
+                                                val newEx = editedSession.exercises.toMutableList(); val newSets = ex.sets.toMutableList()
+                                                newSets[setIdx] = set.copy(currentKg = v); newEx[exIdx] = ex.copy(sets = newSets)
                                                 editedSession = editedSession.copy(exercises = newEx)
                                             }
                                             Text(" kg x ", fontSize = 12.sp)
                                             SetInputField(set.currentReps) { v ->
-                                                val newEx = editedSession.exercises.toMutableList()
-                                                val newSets = ex.sets.toMutableList()
-                                                newSets[setIdx] = set.copy(currentReps = v)
-                                                newEx[exIdx] = ex.copy(sets = newSets)
+                                                val newEx = editedSession.exercises.toMutableList(); val newSets = ex.sets.toMutableList()
+                                                newSets[setIdx] = set.copy(currentReps = v); newEx[exIdx] = ex.copy(sets = newSets)
                                                 editedSession = editedSession.copy(exercises = newEx)
                                             }
                                             Text(" Wdh", fontSize = 12.sp)
@@ -925,10 +895,9 @@ fun SessionDetailDialog(s: WorkoutSession, onUpdate: (WorkoutSession) -> Unit, o
                     }
                 }
                 if (editMode) {
-                    Button(
-                        onClick = { onUpdate(editedSession); editMode = false; onDismiss() },
-                        modifier = Modifier.fillMaxWidth().padding(top = 16.dp)
-                    ) { Text("Änderungen speichern") }
+                    Button(onClick = { onUpdate(editedSession); editMode = false; onDismiss() }, modifier = Modifier.fillMaxWidth().padding(top = 16.dp)) {
+                        Text("Änderungen speichern")
+                    }
                 }
             }
         }
