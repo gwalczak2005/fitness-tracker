@@ -5,9 +5,9 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyItemScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -24,6 +24,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -33,6 +36,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.zIndex
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.example.fitnesstracker.data.*
 import com.example.fitnesstracker.ui.theme.*
@@ -44,6 +48,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
+
 
 // --- Datenmodelle ---
 
@@ -127,6 +132,88 @@ enum class TimeRange(val label: String) {
     ALL("Insgesamt")
 }
 
+// --- Pro-Übung isolierter State -----------------------------------------
+//
+// KERNFIX gegen das Scroll-Ruckeln bei vielen Übungen:
+//
+// Vorher: exercisesPerWorkout[activeName] = nl  ersetzt bei JEDER Änderung
+// (auch bei einem einzelnen Tastendruck in einem Satz) die GESAMTE Liste
+// als neue Objekt-Referenz. Compose kann dann nicht erkennen, dass sich
+// nur EIN Element geändert hat — die ganze Liste gilt als "anders", und
+// die LazyColumn muss bei jedem Scroll/Recompose alle sichtbaren Items
+// neu auswerten. Mit wenigen Übungen fällt das nicht auf (wenig zu tun),
+// mit vielen Übungen (z.B. "Upper 3") wird der Effekt spürbar, weil mehr
+// Items gleichzeitig im/nahe am Viewport liegen und alle re-evaluiert
+// werden müssen.
+//
+// Lösung: Jede Übung bekommt einen eigenen mutableStateOf<Exercise>,
+// gehalten in einer stabilen, pro Workout gecachten Liste von Holdern.
+// Ändert sich Satz 2 von Übung 4, wird NUR der State-Holder für Übung 4
+// invalidiert. Alle anderen ExerciseCard-Composables lesen ihren eigenen
+// State gar nicht neu — Compose überspringt sie komplett (Skipping).
+// ---------------------------------------------------------------------
+
+/** Hält den State für genau eine Übung. Eigene Instanz pro Übung & Workout. */
+@Stable
+class ExerciseHolder(initial: Exercise) {
+    var exercise by mutableStateOf(initial)
+        private set
+
+    fun update(new: Exercise) {
+        exercise = new
+    }
+}
+
+/**
+ * Verwaltet die Liste der ExerciseHolder für ein Workout.
+ * - Stellt eine stabile (sich nicht bei jeder Satz-Änderung ändernde) Liste
+ *   von Holdern für die LazyColumn bereit (`holders`).
+ *   ÄNDERUNGEN AN EINER ÜBUNG ÄNDERN NICHT DIE HOLDER-LISTE, nur den
+ *   internen State des betroffenen Holders.
+ * - Reihenfolge/Hinzufügen/Löschen ändert `holders` (selten, daher unkritisch).
+ * - `snapshot()` liefert die aktuelle List<Exercise> für Persistenz/Session-Ende.
+ */
+@Stable
+class WorkoutExercisesController(initial: List<Exercise>) {
+    val holders: SnapshotStateList<ExerciseHolder> =
+        mutableStateListOf(*initial.map { ExerciseHolder(it) }.toTypedArray())
+
+    fun snapshot(): List<Exercise> = holders.map { it.exercise }
+
+    fun setAll(new: List<Exercise>) {
+        holders.clear()
+        holders.addAll(new.map { ExerciseHolder(it) })
+    }
+
+    fun updateAt(index: Int, new: Exercise) {
+        holders.getOrNull(index)?.update(new)
+    }
+
+    fun addExercise(ex: Exercise) {
+        holders.add(ExerciseHolder(ex))
+    }
+
+    fun removeAt(index: Int) {
+        if (index in holders.indices) holders.removeAt(index)
+    }
+
+    fun moveUp(index: Int) {
+        if (index > 0) {
+            val tmp = holders[index]
+            holders[index] = holders[index - 1]
+            holders[index - 1] = tmp
+        }
+    }
+
+    fun moveDown(index: Int) {
+        if (index < holders.size - 1) {
+            val tmp = holders[index]
+            holders[index] = holders[index + 1]
+            holders[index + 1] = tmp
+        }
+    }
+}
+
 // --- Haupt-Activity ---
 
 class MainActivity : ComponentActivity() {
@@ -146,12 +233,20 @@ fun FitnessTrackerApp() {
 
     var selectedTab          by remember { mutableIntStateOf(0) }
     val workouts             = remember { mutableStateListOf<String>() }
-    val exercisesPerWorkout  = remember { mutableStateMapOf<String, List<Exercise>>() }
+
+    // FIX: statt SnapshotStateMap<String, List<Exercise>> jetzt eine Map auf
+    // WorkoutExercisesController. Der Controller selbst ist stabil — nur sein
+    // Inhalt (einzelne Holder) ändert sich granular.
+    val exerciseControllers  = remember { mutableStateMapOf<String, WorkoutExercisesController>() }
+
     val workoutHistory       = remember { mutableStateListOf<WorkoutSession>() }
     var planName             by remember { mutableStateOf("Mein Plan") }
     var unitsPerWeek         by remember { mutableIntStateOf(4) }
     val sessionStartTimes    = remember { mutableStateMapOf<String, Long>() }
     var saveJob              by remember { mutableStateOf<Job?>(null) }
+
+    fun controllerFor(name: String): WorkoutExercisesController =
+        exerciseControllers.getOrPut(name) { WorkoutExercisesController(emptyList()) }
 
     LaunchedEffect(Unit) {
         try {
@@ -183,8 +278,9 @@ fun FitnessTrackerApp() {
             val freshTemplates = dao.getAllTemplates()
             workouts.clear()
             workouts.addAll(freshTemplates.map { it.name })
-            freshTemplates.forEach {
-                exercisesPerWorkout[it.name] = gson.fromJson(it.exercisesJson, exerciseListType)
+            freshTemplates.forEach { t ->
+                val list: List<Exercise> = gson.fromJson(t.exercisesJson, exerciseListType)
+                exerciseControllers[t.name] = WorkoutExercisesController(list)
             }
             val freshHistory = dao.getAllHistory()
             workoutHistory.clear()
@@ -199,14 +295,19 @@ fun FitnessTrackerApp() {
         val snap1 = planName
         val snap2 = unitsPerWeek
         val snap3 = workouts.toList()
-        val snap4 = exercisesPerWorkout.toMap()
+        // Snapshot aller Controller-Inhalte für den IO-Thread
+        val snap4: Map<String, List<Exercise>> = snap3.associateWith { n -> controllerFor(n).snapshot() }
         saveJob?.cancel()
         saveJob = scope.launch(Dispatchers.IO) {
             delay(SAVE_DEBOUNCE_MS)
+            // FIX: Settings + alle Templates in je einer Transaktion statt
+            // N einzelner Transaktionen — deutlich weniger DB-Overhead
             dao.saveSettings(SettingsEntity(planName = snap1, unitsPerWeek = snap2))
-            snap3.forEachIndexed { i, n ->
-                dao.insertTemplate(WorkoutTemplateEntity(n, gson.toJson(snap4[n] ?: emptyList<Exercise>()), i))
-            }
+            dao.replaceAllTemplates(
+                snap3.mapIndexed { i, n ->
+                    WorkoutTemplateEntity(n, gson.toJson(snap4[n] ?: emptyList<Exercise>()), i)
+                }
+            )
         }
     }
 
@@ -236,15 +337,22 @@ fun FitnessTrackerApp() {
             if (selectedTab == 0) {
                 TrainingScreen(
                     workouts            = workouts,
-                    exercisesPerWorkout = exercisesPerWorkout,
+                    controllerFor       = ::controllerFor,
                     sessionStartTimes   = sessionStartTimes,
                     onDataChange        = triggerSave,
                     onFinishSession     = { workoutName ->
-                        val startTime = sessionStartTimes[workoutName] ?: return@TrainingScreen
-                        val endTime   = System.currentTimeMillis()
-                        val sdfD      = SimpleDateFormat("dd. MMMM yyyy", Locale.GERMAN)
-                        val sdfT      = SimpleDateFormat("HH:mm", Locale.GERMAN)
-                        val currentEx = exercisesPerWorkout[workoutName] ?: emptyList()
+                        // FIX: startTime setzen falls der Nutzer keine Werte eingetragen hat
+                        // (sessionStartTimes wird sonst erst beim ersten Tippen gesetzt, was
+                        // bei unverändertem Workout einen leeren return verursacht)
+                        if (!sessionStartTimes.containsKey(workoutName)) {
+                            sessionStartTimes[workoutName] = System.currentTimeMillis()
+                        }
+                        val startTime   = sessionStartTimes[workoutName] ?: return@TrainingScreen
+                        val endTime     = System.currentTimeMillis()
+                        val sdfD        = SimpleDateFormat("dd. MMMM yyyy", Locale.GERMAN)
+                        val sdfT        = SimpleDateFormat("HH:mm", Locale.GERMAN)
+                        val controller  = controllerFor(workoutName)
+                        val currentEx   = controller.snapshot()
 
                         val sessionToSave = WorkoutSession(
                             name      = workoutName,
@@ -261,7 +369,7 @@ fun FitnessTrackerApp() {
                         }
 
                         sessionStartTimes.remove(workoutName)
-                        exercisesPerWorkout[workoutName] = resetExercises
+                        controller.setAll(resetExercises)
 
                         scope.launch(Dispatchers.IO) {
                             try {
@@ -271,9 +379,12 @@ fun FitnessTrackerApp() {
                                     exercisesJson = gson.toJson(sessionToSave.exercises),
                                     timestamp = sessionToSave.timestamp
                                 ))
-                                workouts.toList().forEachIndexed { i, n ->
-                                    dao.insertTemplate(WorkoutTemplateEntity(n, gson.toJson(exercisesPerWorkout[n] ?: emptyList<Exercise>()), i))
-                                }
+                                val snap3 = workouts.toList()
+                                dao.replaceAllTemplates(
+                                    snap3.mapIndexed { i, n ->
+                                        WorkoutTemplateEntity(n, gson.toJson(controllerFor(n).snapshot()), i)
+                                    }
+                                )
                                 withContext(Dispatchers.Main) {
                                     workoutHistory.add(0, sessionToSave.copy(id = id))
                                 }
@@ -281,11 +392,20 @@ fun FitnessTrackerApp() {
                         }
                     },
                     onDeleteWorkout = { name ->
+                        exerciseControllers.remove(name)
                         scope.launch(Dispatchers.IO) { dao.deleteTemplate(name) }
+                    },
+                    onAddWorkout = { name ->
+                        exerciseControllers[name] = WorkoutExercisesController(emptyList())
+                    },
+                    onRenameWorkout = { old, new ->
+                        exerciseControllers[new] = exerciseControllers.remove(old) ?: WorkoutExercisesController(emptyList())
                     }
                 )
             } else {
-                StatisticsScreen(workouts, workoutHistory, planName, { planName = it; triggerSave() }, unitsPerWeek, { unitsPerWeek = it; triggerSave() }, exercisesPerWorkout, onUpdateSession)
+                val historySnapshotMap: Map<String, List<Exercise>> =
+                    workouts.associateWith { n -> controllerFor(n).snapshot() }
+                StatisticsScreen(workouts, workoutHistory, planName, { planName = it; triggerSave() }, unitsPerWeek, { unitsPerWeek = it; triggerSave() }, historySnapshotMap, onUpdateSession)
             }
         }
     }
@@ -297,11 +417,13 @@ fun FitnessTrackerApp() {
 @Composable
 fun TrainingScreen(
     workouts: SnapshotStateList<String>,
-    exercisesPerWorkout: SnapshotStateMap<String, List<Exercise>>,
+    controllerFor: (String) -> WorkoutExercisesController,
     sessionStartTimes: SnapshotStateMap<String, Long>,
     onDataChange: () -> Unit,
     onFinishSession: (String) -> Unit,
-    onDeleteWorkout: (String) -> Unit
+    onDeleteWorkout: (String) -> Unit,
+    onAddWorkout: (String) -> Unit,
+    onRenameWorkout: (String, String) -> Unit
 ) {
     var activeIdx by remember { mutableIntStateOf(0) }
     var showAddW  by remember { mutableStateOf(false) }; var newWN by remember { mutableStateOf("") }
@@ -309,19 +431,21 @@ fun TrainingScreen(
     var editIdx   by remember { mutableStateOf<Int?>(null) }
     var showOpt   by remember { mutableStateOf(false) }
     var showRen   by remember { mutableStateOf(false) }; var renV by remember { mutableStateOf("") }
+    var moveExIdx by remember { mutableStateOf<Int?>(null) }
+
+    // --- NEU: Drag-to-Reorder State für die Trainings-Tabs ---
+    // tabBounds merkt sich pro Index die X-Position und Breite innerhalb der Row,
+    // damit wir beim Ziehen erkennen können, über welchem Nachbar-Tab wir gerade sind.
+    val tabBounds       = remember { mutableStateMapOf<Int, Pair<Float, Float>>() }
+    var draggingIndex   by remember { mutableStateOf<Int?>(null) }
+    var dragOffsetX     by remember { mutableStateOf(0f) }
+    var didDrag         by remember { mutableStateOf(false) }
 
     val safeActiveIdx = activeIdx.coerceIn(0, (workouts.size - 1).coerceAtLeast(0))
     if (safeActiveIdx != activeIdx) activeIdx = safeActiveIdx
 
     val activeName = workouts.getOrNull(activeIdx) ?: ""
-
-    // FIX Scroll-Performance: derivedStateOf liest exercisesPerWorkout nur dann neu,
-    // wenn sich die Liste für das aktive Workout tatsächlich geändert hat.
-    // Ohne dies registriert jede Komposition die gesamte Map als Abhängigkeit →
-    // jede Änderung an einem beliebigen Workout invalidiert die ganze LazyColumn.
-    val currentEx by remember(activeName) {
-        derivedStateOf { exercisesPerWorkout[activeName] ?: emptyList() }
-    }
+    val controller = controllerFor(activeName)
 
     if (showAddW) {
         AlertDialog(
@@ -329,7 +453,12 @@ fun TrainingScreen(
             title = { Text("Neues Training") },
             text  = { TextField(newWN, { newWN = it }, placeholder = { Text("Name") }, modifier = Modifier.fillMaxWidth()) },
             confirmButton = { TextButton(onClick = {
-                if (newWN.isNotBlank()) { workouts.add(newWN); exercisesPerWorkout[newWN] = emptyList(); activeIdx = workouts.size - 1; newWN = ""; showAddW = false; onDataChange() }
+                if (newWN.isNotBlank()) {
+                    workouts.add(newWN)
+                    onAddWorkout(newWN)
+                    activeIdx = workouts.size - 1
+                    newWN = ""; showAddW = false; onDataChange()
+                }
             }) { Text("Hinzufügen") } },
             dismissButton = { TextButton(onClick = { showAddW = false }) { Text("Abbrechen") } }
         )
@@ -343,7 +472,7 @@ fun TrainingScreen(
             confirmButton = { TextButton(onClick = { renV = name; showOpt = false; showRen = true }) { Text("Umbenennen") } },
             dismissButton = { TextButton(onClick = {
                 val removed = workouts.removeAt(editIdx!!)
-                exercisesPerWorkout.remove(removed); onDeleteWorkout(removed)
+                onDeleteWorkout(removed)
                 activeIdx = activeIdx.coerceIn(0, (workouts.size - 1).coerceAtLeast(0))
                 showOpt = false; onDataChange()
             }, colors = ButtonDefaults.textButtonColors(contentColor = Color.Red)) { Text("Löschen") } }
@@ -357,7 +486,7 @@ fun TrainingScreen(
             confirmButton = { TextButton(onClick = {
                 if (renV.isNotBlank()) {
                     val old = workouts[editIdx!!]; workouts[editIdx!!] = renV
-                    exercisesPerWorkout[renV] = exercisesPerWorkout.remove(old) ?: emptyList()
+                    onRenameWorkout(old, renV)
                     showRen = false; onDataChange()
                 }
             }) { Text("Speichern") } },
@@ -371,11 +500,59 @@ fun TrainingScreen(
             text  = { TextField(newEN, { newEN = it }, placeholder = { Text("Übungsname") }, modifier = Modifier.fillMaxWidth()) },
             confirmButton = { TextButton(onClick = {
                 if (newEN.isNotBlank()) {
-                    exercisesPerWorkout[activeName] = currentEx + Exercise(newEN, sets = listOf(WorkoutSet("", "", "", "")))
+                    controller.addExercise(Exercise(newEN, sets = listOf(WorkoutSet("", "", "", ""))))
                     newEN = ""; showAddEx = false; onDataChange()
                 }
             }) { Text("Hinzufügen") } },
             dismissButton = { TextButton(onClick = { showAddEx = false }) { Text("Abbrechen") } }
+        )
+    }
+
+    // NEU: Dialog zum Verschieben einer Übung in ein anderes Training.
+    // Zeigt alle Trainings außer dem aktuell aktiven zur Auswahl an. Bei Auswahl
+    // wird die Übung (inkl. aller ihrer Sätze) aus dem aktuellen Controller entfernt
+    // und dem Ziel-Controller hinzugefügt (dort ans Ende angehängt).
+    if (moveExIdx != null) {
+        val idxToMove       = moveExIdx!!
+        val exerciseToMove  = controller.holders.getOrNull(idxToMove)?.exercise
+        val targetWorkouts  = workouts.filter { it != activeName }
+        AlertDialog(
+            onDismissRequest = { moveExIdx = null },
+            title = { Text("Übung verschieben") },
+            text = {
+                Column {
+                    Text(
+                        "\"${exerciseToMove?.name ?: ""}\" verschieben nach:",
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    if (targetWorkouts.isEmpty()) {
+                        Text("Kein weiteres Training vorhanden.", color = Color.Gray, fontSize = 13.sp)
+                    } else {
+                        targetWorkouts.forEach { targetName ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        exerciseToMove?.let { ex ->
+                                            controller.removeAt(idxToMove)
+                                            controllerFor(targetName).addExercise(ex)
+                                            onDataChange()
+                                        }
+                                        moveExIdx = null
+                                    }
+                                    .padding(vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(targetName, modifier = Modifier.weight(1f))
+                                Icon(Icons.Default.KeyboardArrowRight, null, tint = BluePrimary)
+                            }
+                            if (targetName != targetWorkouts.last()) Divider(color = BorderColor.copy(0.3f))
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { moveExIdx = null }) { Text("Abbrechen") } }
         )
     }
 
@@ -386,62 +563,92 @@ fun TrainingScreen(
             Spacer(Modifier.height(16.dp))
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 workouts.forEachIndexed { i, n ->
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Box(Modifier.combinedClickable(onClick = { activeIdx = i }, onLongClick = { editIdx = i; showOpt = true }).padding(8.dp)) {
+                    // key(n) sorgt dafür, dass Compose die Composable-Identität pro
+                    // Workout-Name (nicht pro Index) verfolgt, damit die laufende
+                    // Drag-Coroutine beim Umsortieren am richtigen Tab hängen bleibt.
+                    key(n) {
+                        val isDragging = draggingIndex == i
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .onGloballyPositioned { coords ->
+                                    tabBounds[i] = coords.positionInParent().x to coords.size.width.toFloat()
+                                }
+                                .graphicsLayer {
+                                    translationX = if (isDragging) dragOffsetX else 0f
+                                    scaleX = if (isDragging) 1.08f else 1f
+                                    scaleY = if (isDragging) 1.08f else 1f
+                                    alpha  = if (isDragging) 0.9f else 1f
+                                }
+                                .zIndex(if (isDragging) 1f else 0f)
+                                .pointerInput(n) {
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = {
+                                            draggingIndex = workouts.indexOf(n)
+                                            dragOffsetX = 0f
+                                            didDrag = false
+                                        },
+                                        onDragEnd = {
+                                            if (!didDrag) {
+                                                // Kein Ziehen -> normales Long-Press-Verhalten (Umbenennen/Löschen)
+                                                val idx = workouts.indexOf(n)
+                                                if (idx != -1) { editIdx = idx; showOpt = true }
+                                            } else {
+                                                onDataChange()
+                                            }
+                                            draggingIndex = null
+                                            dragOffsetX = 0f
+                                        },
+                                        onDragCancel = {
+                                            draggingIndex = null
+                                            dragOffsetX = 0f
+                                        },
+                                        onDrag = { change, dragAmount ->
+                                            change.consume()
+                                            didDrag = true
+                                            dragOffsetX += dragAmount.x
+
+                                            val currentIndex = workouts.indexOf(n)
+                                            if (currentIndex == -1) return@detectDragGesturesAfterLongPress
+                                            val (myX, myWidth) = tabBounds[currentIndex] ?: return@detectDragGesturesAfterLongPress
+                                            val myCenter = myX + dragOffsetX + myWidth / 2f
+
+                                            val targetIndex = tabBounds.entries.firstOrNull { (idx, b) ->
+                                                idx != currentIndex && myCenter > b.first && myCenter < b.first + b.second
+                                            }?.key
+
+                                            if (targetIndex != null && targetIndex != currentIndex) {
+                                                val activeWorkoutName = workouts.getOrNull(activeIdx)
+                                                val moved = workouts.removeAt(currentIndex)
+                                                workouts.add(targetIndex, moved)
+                                                activeIdx = activeWorkoutName?.let { workouts.indexOf(it) } ?: activeIdx
+
+                                                val (newX, _) = tabBounds[targetIndex] ?: (myX to myWidth)
+                                                dragOffsetX -= (newX - myX)
+                                                draggingIndex = targetIndex
+                                            }
+                                        }
+                                    )
+                                }
+                                .combinedClickable(onClick = { if (draggingIndex == null) activeIdx = i })
+                                .padding(8.dp)
+                        ) {
                             Text(n, color = if (activeIdx == i) Color.White else Color.White.copy(0.6f), fontWeight = if (activeIdx == i) FontWeight.Bold else FontWeight.Normal)
+                            if (activeIdx == i) Box(Modifier.width(40.dp).height(2.dp).background(Color.White))
                         }
-                        if (activeIdx == i) Box(Modifier.width(40.dp).height(2.dp).background(Color.White))
                     }
                 }
                 TextButton(onClick = { showAddW = true }) { Text("+ Neu", color = Color.White.copy(0.6f)) }
             }
         }
 
-        // FIX Scroll-Performance: Callbacks mit remember(activeName, currentEx) stabilisieren.
-        // Neue Lambda-Instanzen bei jedem Recompose gelten für Compose als "geänderte Parameter"
-        // → alle ExerciseCards werden neu gezeichnet, auch wenn sich nichts geändert hat.
-        // Mit remember werden dieselben Instanzen wiederverwendet solange activeName/currentEx gleich bleiben.
-        val onExerciseChange: (Int, Exercise) -> Unit = remember(activeName, currentEx) {
-            { idx, updated ->
-                if (!sessionStartTimes.containsKey(activeName)) {
-                    sessionStartTimes[activeName] = System.currentTimeMillis()
-                }
-                val nl = currentEx.toMutableList(); nl[idx] = updated
-                exercisesPerWorkout[activeName] = nl
-                onDataChange()
-            }
-        }
-        val onExerciseDelete: (Int) -> Unit = remember(activeName, currentEx) {
-            { idx ->
-                val nl = currentEx.toMutableList(); nl.removeAt(idx)
-                exercisesPerWorkout[activeName] = nl; onDataChange()
-            }
-        }
-        val onExerciseRename: (Int, String) -> Unit = remember(activeName, currentEx) {
-            { idx, name ->
-                val nl = currentEx.toMutableList(); nl[idx] = currentEx[idx].copy(name = name)
-                exercisesPerWorkout[activeName] = nl; onDataChange()
-            }
-        }
-        val onMoveUp: (Int) -> Unit = remember(activeName, currentEx) {
-            { idx ->
-                if (idx > 0) {
-                    val nl = currentEx.toMutableList()
-                    val tmp = nl[idx]; nl[idx] = nl[idx - 1]; nl[idx - 1] = tmp
-                    exercisesPerWorkout[activeName] = nl; onDataChange()
-                }
-            }
-        }
-        val onMoveDown: (Int) -> Unit = remember(activeName, currentEx) {
-            { idx ->
-                if (idx < currentEx.size - 1) {
-                    val nl = currentEx.toMutableList()
-                    val tmp = nl[idx]; nl[idx] = nl[idx + 1]; nl[idx + 1] = tmp
-                    exercisesPerWorkout[activeName] = nl; onDataChange()
-                }
-            }
-        }
-
+        // FIX KERNSTÜCK: LazyColumn iteriert über controller.holders — eine stabile
+        // SnapshotStateList<ExerciseHolder>. Diese Liste ändert sich NUR, wenn Übungen
+        // hinzugefügt/gelöscht/verschoben werden (selten), NICHT wenn ein einzelner
+        // Satzwert getippt wird. Das bedeutet: beim Tippen in Übung 4 liest nur die
+        // ExerciseCard von Übung 4 ihren eigenen Holder-State neu — alle anderen
+        // Karten werden von Compose komplett übersprungen (skipped), unabhängig
+        // davon wie viele Übungen insgesamt sichtbar sind.
         LazyColumn(
             modifier        = Modifier.fillMaxSize(),
             contentPadding  = PaddingValues(16.dp),
@@ -449,20 +656,27 @@ fun TrainingScreen(
         ) {
             item { Text("ÜBUNGEN", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DarkGray) }
 
-            // key(ex.name): stabile Item-Identität → Compose zeichnet nur die tatsächlich
-            // geänderte Card neu, nicht alle sichtbaren Items auf einmal.
-            itemsIndexed(currentEx, key = { _, ex -> ex.name }) { i, ex ->
-                // FIX Scroll-Performance: ExerciseCard in separater Composable-Funktion mit
-                // stabilen Parametern. Compose kann dadurch den Recomposition-Scope auf die
-                // einzelne Card beschränken ("smart recomposition") statt die ganze Liste neu
-                // zu zeichnen.
-                ExerciseCard(
-                    ex         = ex,
-                    onChange   = { up -> onExerciseChange(i, up) },
-                    onDel      = { onExerciseDelete(i) },
-                    onRen      = { n -> onExerciseRename(i, n) },
-                    onMoveUp   = if (i > 0)                  { { onMoveUp(i) }   } else null,
-                    onMoveDown = if (i < currentEx.size - 1) { { onMoveDown(i) } } else null
+            itemsIndexed(controller.holders, key = { _, holder -> System.identityHashCode(holder) }) { i, holder ->
+                ExerciseCardHolder(
+                    holder = holder,
+                    onChange = { up ->
+                        if (!sessionStartTimes.containsKey(activeName)) {
+                            sessionStartTimes[activeName] = System.currentTimeMillis()
+                        }
+                        holder.update(up)
+                        onDataChange()
+                    },
+                    onDel = {
+                        controller.removeAt(i)
+                        onDataChange()
+                    },
+                    onRen = { n ->
+                        holder.update(holder.exercise.copy(name = n))
+                        onDataChange()
+                    },
+                    onMoveUp   = if (i > 0)                          { { controller.moveUp(i);   onDataChange() } } else null,
+                    onMoveDown = if (i < controller.holders.size - 1) { { controller.moveDown(i); onDataChange() } } else null,
+                    onMoveToOther = if (workouts.size > 1) { { moveExIdx = i } } else null
                 )
             }
 
@@ -473,7 +687,7 @@ fun TrainingScreen(
                     Text("+ Neue Übung", color = BluePrimary)
                 }
             }
-            if (currentEx.isNotEmpty()) {
+            if (controller.holders.isNotEmpty()) {
                 item {
                     Button(onClick = { onFinishSession(activeName) }, Modifier.fillMaxWidth().height(60.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))) {
@@ -489,6 +703,34 @@ fun TrainingScreen(
     }
 }
 
+/**
+ * Liest den Exercise-Wert AUS DEM HOLDER SELBST (holder.exercise), nicht als Parameter
+ * von außen. Das ist entscheidend: Da nur dieser Composable den Holder-State liest,
+ * ist auch nur dieser Composable von Änderungen daran betroffen — Compose kann ihn
+ * gezielt neu zeichnen, ohne Geschwister-Items in der LazyColumn anzufassen.
+ */
+@Composable
+fun ExerciseCardHolder(
+    holder: ExerciseHolder,
+    onChange: (Exercise) -> Unit,
+    onDel: () -> Unit,
+    onRen: (String) -> Unit,
+    onMoveUp: (() -> Unit)? = null,
+    onMoveDown: (() -> Unit)? = null,
+    onMoveToOther: (() -> Unit)? = null
+) {
+    val ex = holder.exercise
+    ExerciseCard(
+        ex = ex,
+        onChange = onChange,
+        onDel = onDel,
+        onRen = onRen,
+        onMoveUp = onMoveUp,
+        onMoveDown = onMoveDown,
+        onMoveToOther = onMoveToOther
+    )
+}
+
 @Composable
 fun ExerciseCard(
     ex: Exercise,
@@ -496,7 +738,8 @@ fun ExerciseCard(
     onDel: () -> Unit,
     onRen: (String) -> Unit,
     onMoveUp: (() -> Unit)? = null,
-    onMoveDown: (() -> Unit)? = null
+    onMoveDown: (() -> Unit)? = null,
+    onMoveToOther: (() -> Unit)? = null
 ) {
     var menu       by remember { mutableStateOf(false) }
     var ren        by remember { mutableStateOf(false) }
@@ -545,6 +788,7 @@ fun ExerciseCard(
                         }, leadingIcon = { Icon(Icons.Default.Add, null) })
                         if (onMoveUp != null)   DropdownMenuItem(text = { Text("Nach oben verschieben") },   onClick = { onMoveUp();   menu = false }, leadingIcon = { Icon(Icons.Default.KeyboardArrowUp, null) })
                         if (onMoveDown != null) DropdownMenuItem(text = { Text("Nach unten verschieben") }, onClick = { onMoveDown(); menu = false }, leadingIcon = { Icon(Icons.Default.KeyboardArrowDown, null) })
+                        if (onMoveToOther != null) DropdownMenuItem(text = { Text("In anderes Training verschieben") }, onClick = { menu = false; onMoveToOther() }, leadingIcon = { Icon(Icons.Default.KeyboardArrowRight, null) })
                         DropdownMenuItem(text = { Text("Beschreibung") },            onClick = { menu = false; showDesc = !showDesc },         leadingIcon = { Icon(Icons.Default.Info, null) })
                         DropdownMenuItem(text = { Text("Beschreibung bearbeiten") }, onClick = { menu = false; dVal = description; descDialog = true }, leadingIcon = { Icon(Icons.Default.Edit, null) })
                         DropdownMenuItem(text = { Text("Umbenennen") },              onClick = { menu = false; rVal = ex.name; ren = true },   leadingIcon = { Icon(Icons.Default.Edit, null) })
@@ -555,9 +799,6 @@ fun ExerciseCard(
 
             Spacer(Modifier.height(12.dp))
 
-            // Row + horizontalScroll statt LazyRow: verschachtelte Lazy-Layouts verursachen
-            // bei jedem Scroll-Frame teure Layout-Neuberechnungen. Da pro Übung max. ~8 Sätze
-            // existieren ist Virtualisierung unnötig — normales Row ist hier deutlich schneller.
             Row(
                 modifier            = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)

@@ -70,6 +70,18 @@ interface FitnessDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun saveSettings(settings: SettingsEntity)
+
+    @Query("DELETE FROM workout_templates")
+    suspend fun deleteAllTemplates()
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTemplates(templates: List<WorkoutTemplateEntity>)
+
+    @Transaction
+    suspend fun replaceAllTemplates(templates: List<WorkoutTemplateEntity>) {
+        deleteAllTemplates()
+        insertTemplates(templates)
+    }
 }
 
 @Database(
